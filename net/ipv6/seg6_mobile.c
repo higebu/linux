@@ -120,11 +120,14 @@ enum seg6_mobile_srh_state {
  * ABSENT (forward) from MALFORMED (drop); folding them into one NULL
  * return as seg6_local does is not sufficient here.
  *
- * The happy path reuses seg6.c::seg6_get_srh().  When that returns
- * NULL the failure is reclassified by re-probing the extension chain
- * for IPPROTO_ROUTING: a clean -ENOENT means ABSENT, anything else
- * (truncated chain, invalid length, seg6_validate_srh failure) means
- * MALFORMED.
+ * The happy path reuses seg6.c::seg6_get_srh() without the
+ * IP6_FH_F_SKIP_RH flag, so an SRH whose Segments Left has already
+ * been decremented to zero (the terminal-SID case in RFC 9433
+ * Section 6.6 et al.) is reported as PRESENT rather than spuriously
+ * looking ABSENT.  When seg6_get_srh() returns NULL the failure is
+ * reclassified by re-probing the extension chain for IPPROTO_ROUTING:
+ * a clean -ENOENT means ABSENT, anything else (truncated chain,
+ * invalid length, seg6_validate_srh failure) means MALFORMED.
  */
 static struct ipv6_sr_hdr *
 seg6_mobile_get_and_validate_srh(struct sk_buff *skb,
@@ -135,7 +138,7 @@ seg6_mobile_get_and_validate_srh(struct sk_buff *skb,
 	int hdr_proto;
 	int flags = 0;
 
-	srh = seg6_get_srh(skb, IP6_FH_F_SKIP_RH);
+	srh = seg6_get_srh(skb, 0);
 	if (srh) {
 #ifdef CONFIG_IPV6_SEG6_HMAC
 		if (!seg6_hmac_validate_skb(skb)) {
