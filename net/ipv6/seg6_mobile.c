@@ -14,9 +14,16 @@
 #include <linux/tcp.h>
 #include <linux/types.h>
 #include <linux/udp.h>
+#include <linux/unaligned.h>
 #include <net/checksum.h>
+#include <net/dsfield.h>
+#include <net/gtp.h>
+#include <net/ip.h>
+#include <net/ip6_route.h>
+#include <net/ip_tunnels.h>
 #include <net/ipv6.h>
 #include <net/lwtunnel.h>
+#include <net/route.h>
 #include <net/seg6.h>
 #ifdef CONFIG_IPV6_SEG6_HMAC
 #include <net/seg6_hmac.h>
@@ -33,6 +40,15 @@ struct seg6_mobile_action_desc {
 	unsigned long attrs;
 	unsigned long optattrs;
 	int (*input)(struct sk_buff *skb, struct seg6_mobile_lwt *slwt);
+
+	/* Optional cross-attribute sanity check invoked from
+	 * seg6_mobile_build_state() after all per-attribute parse()
+	 * callbacks have populated @slwt.  Used by actions whose
+	 * attribute constraints span more than one attribute (e.g.
+	 * End.M.GTP4.E enforces v6_src_prefix_len + 32 <= 128).
+	 */
+	int (*validate)(struct seg6_mobile_lwt *slwt,
+			struct netlink_ext_ack *extack);
 };
 
 struct seg6_mobile_action_param {
@@ -72,6 +88,10 @@ struct seg6_mobile_counters {
 struct seg6_mobile_lwt {
 	int action;
 	struct in6_addr nh6;
+	u8 pdu_type;
+	bool pdu_type_set;
+	u8 v6_src_prefix_len;
+	u8 sr_prefix_len;
 	const struct seg6_mobile_action_desc *desc;
 	struct pcpu_seg6_mobile_counters __percpu *pcpu_counters;
 
@@ -270,6 +290,367 @@ drop:
 	return -EINVAL;
 }
 
+/* Args.Mob.Session: 40-bit field laid out as
+ * QFI(6) | R(1) | U(1) | PDU Session ID(32).
+ */
+#define SEG6_MOBILE_ARGS_MOB_LEN	40
+#define SEG6_MOBILE_ARGS_QFI_SHIFT	58
+#define SEG6_MOBILE_ARGS_TEID_SHIFT	24
+
+/* GTPv1-U mandatory header flags: Version=1 (bits 7..5 = 001) +
+ * Protocol Type=1 (bit 4); E/S/PN bits are clear by default.
+ * GTP1_F_EXTHDR is ORed in by the caller when a PDU Session extension
+ * header follows.
+ */
+#define SEG6_MOBILE_GTP1U_FLAGS_BASE	0x30
+
+/* GTP-U PDU Session extension header.  Minimum 4-byte unit:
+ * ext_len = 1, PDU Type in high 4 bits of @pdu_type_spare, QFI in
+ * low 6 bits of @spare_qfi, next_ext = 0.
+ */
+struct seg6_mobile_pdu_session_ext {
+	__u8	ext_len;
+	__u8	pdu_type_spare;
+	__u8	spare_qfi;
+	__u8	next_ext;
+};
+
+#define SEG6_MOBILE_PDU_SESSION_NH		0x85
+#define SEG6_MOBILE_PDU_SESSION_QFI_MASK	0x3f
+#define SEG6_MOBILE_V6_SRC_PREFIX_LEN_DEFAULT	64
+
+/* Read @nbits from a 16-byte big-endian @addr at bit offset @bit_off,
+ * returned left-justified in 64 bits.  Caller ensures
+ * bit_off + nbits <= 128 and 1 <= nbits <= 64.
+ */
+static u64 seg6_mobile_addr_get_bits(const u8 *addr, unsigned int bit_off,
+				     unsigned int nbits)
+{
+	u64 hi = get_unaligned_be64(addr);
+	u64 lo = get_unaligned_be64(addr + 8);
+	u64 v;
+
+	if (bit_off == 0)
+		v = hi;
+	else if (bit_off < 64)
+		v = (hi << bit_off) | (lo >> (64 - bit_off));
+	else
+		v = lo << (bit_off - 64);
+
+	return v & GENMASK_ULL(63, 64 - nbits);
+}
+
+/* Extract the IPv4 DA and Args.Mob.Session from an End.M.GTP4.E SID,
+ * where the SR Gateway locator occupies the leading @locator_bits
+ * bits of the IPv6 destination, the IPv4 DA the next 32 bits, and
+ * Args.Mob.Session the 40 bits that follow it (RFC 9433).
+ * seg6_mobile_v4_validate() guarantees the three fields fit in 128
+ * bits at build time.
+ */
+static void seg6_mobile_parse_gtp4_sid(const struct in6_addr *daddr,
+				       unsigned int locator_bits,
+				       __be32 *v4_da, u64 *args_mob)
+{
+	u64 da_field;
+
+	da_field = seg6_mobile_addr_get_bits(daddr->s6_addr, locator_bits, 32);
+	*v4_da = htonl((u32)(da_field >> 32));
+
+	*args_mob = seg6_mobile_addr_get_bits(daddr->s6_addr,
+					      locator_bits + 32,
+					      SEG6_MOBILE_ARGS_MOB_LEN);
+}
+
+/* Recover the IPv4 source address (RFC 9433): exactly 32 bits taken
+ * from the inbound IPv6 SA at bit offset @v6_src_prefix_len (or /64
+ * when unset).  The trailing bits are "any bit pattern (ignored)" and
+ * are not read.
+ */
+static __be32 seg6_mobile_v4_sa(const struct in6_addr *ip6_sa,
+				u8 v6_src_prefix_len)
+{
+	u8 p_bits = v6_src_prefix_len ? : SEG6_MOBILE_V6_SRC_PREFIX_LEN_DEFAULT;
+	u64 sa_field;
+
+	sa_field = seg6_mobile_addr_get_bits(ip6_sa->s6_addr, p_bits, 32);
+	return htonl((u32)(sa_field >> 32));
+}
+
+static u8 seg6_mobile_qfi_from_args(u64 args_mob)
+{
+	return (args_mob >> SEG6_MOBILE_ARGS_QFI_SHIFT) &
+	       SEG6_MOBILE_PDU_SESSION_QFI_MASK;
+}
+
+static u32 seg6_mobile_teid_from_args(u64 args_mob)
+{
+	return lower_32_bits(args_mob >> SEG6_MOBILE_ARGS_TEID_SHIFT);
+}
+
+/* Push a GTP-U header on top of @skb.  When @pdu_type_set is true the
+ * GTPv1 long header (with the EH bit set) is followed by a 4-byte
+ * PDU Session extension header; @pdu_type selects the PDU Type field
+ * (0 for downlink, 1 for uplink, 2..15 reserved).  When
+ * @pdu_type_set is false the GTPv1 short header is emitted with no
+ * PDU Session, regardless of @qfi.
+ */
+static void seg6_mobile_push_gtpu(struct sk_buff *skb, u32 teid, u8 qfi,
+				  u8 pdu_type, bool pdu_type_set)
+{
+	struct seg6_mobile_pdu_session_ext *pdu_session;
+	struct gtp1_header_long *gtphl;
+	struct gtp1_header *gtph;
+
+	if (!pdu_type_set) {
+		gtph = skb_push(skb, sizeof(*gtph));
+		gtph->flags = SEG6_MOBILE_GTP1U_FLAGS_BASE;
+		gtph->type = GTP_TPDU;
+		gtph->length = htons(skb->len - sizeof(*gtph));
+		gtph->tid = htonl(teid);
+		return;
+	}
+
+	pdu_session = skb_push(skb, sizeof(*pdu_session));
+	pdu_session->ext_len = 1;
+	pdu_session->pdu_type_spare = (pdu_type & 0xf) << 4;
+	pdu_session->spare_qfi = qfi & SEG6_MOBILE_PDU_SESSION_QFI_MASK;
+	pdu_session->next_ext = 0;
+
+	gtphl = skb_push(skb, sizeof(*gtphl));
+	gtphl->flags = SEG6_MOBILE_GTP1U_FLAGS_BASE | GTP1_F_EXTHDR;
+	gtphl->type = GTP_TPDU;
+	gtphl->length = htons(skb->len - sizeof(struct gtp1_header));
+	gtphl->tid = htonl(teid);
+	gtphl->seq = 0;
+	gtphl->npdu = 0;
+	gtphl->next = SEG6_MOBILE_PDU_SESSION_NH;
+}
+
+/* Build the outer IPv4 + UDP + GTPv1-U[+PDU Session] header chain on
+ * @skb and ship it via the IPv4 input path.  The IPv6 outer and its
+ * extension headers must already have been popped.
+ */
+static int seg6_mobile_xmit_gtp4_e(struct net *net, struct sk_buff *skb,
+				   struct seg6_mobile_lwt *slwt,
+				   __be32 v4_sa, __be32 v4_da, u32 teid,
+				   u8 qfi, __be16 inner_proto, u8 outer_tclass,
+				   u8 outer_hoplimit)
+{
+	enum skb_drop_reason reason;
+	unsigned int inner_nhlen;
+	struct udphdr *uh;
+	struct iphdr *iph;
+	int err;
+
+	if (skb_cow_head(skb,
+			 sizeof(*iph) + sizeof(*uh) +
+			 sizeof(struct gtp1_header_long) +
+			 sizeof(struct seg6_mobile_pdu_session_ext)))
+		return -ENOMEM;
+
+	/* A GSO T-PDU must be re-segmented through the UDP-tunnel path once
+	 * the outer IPv4/UDP/GTP-U chain is prepended, otherwise the GSO
+	 * engine cannot find the inner transport header and drops it.  Mark
+	 * the skb encapsulated and snapshot the inner IP headers so the
+	 * segmenter emits one GTP-U packet per inner segment.  Non-GSO
+	 * T-PDUs need none of this and are shipped as-is.
+	 */
+	if (inner_proto && skb_is_gso(skb)) {
+		if (inner_proto == htons(ETH_P_IP)) {
+			if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+				return -ENOMEM;
+			inner_nhlen = ip_hdrlen(skb);
+		} else {
+			inner_nhlen = sizeof(struct ipv6hdr);
+		}
+		skb_set_transport_header(skb, inner_nhlen);
+		skb_reset_mac_header(skb);
+		err = iptunnel_handle_offloads(skb, SKB_GSO_UDP_TUNNEL);
+		if (err)
+			return err;
+		skb_set_inner_protocol(skb, inner_proto);
+	}
+
+	seg6_mobile_push_gtpu(skb, teid, qfi, slwt->pdu_type,
+			      slwt->pdu_type_set);
+
+	uh = skb_push(skb, sizeof(*uh));
+	skb_reset_transport_header(skb);
+	uh->source = htons(GTP1U_PORT);
+	uh->dest = htons(GTP1U_PORT);
+	uh->len = htons(skb->len);
+	uh->check = 0;
+
+	iph = skb_push(skb, sizeof(*iph));
+	skb_reset_network_header(skb);
+	iph->version = 4;
+	iph->ihl = sizeof(*iph) >> 2;
+	iph->tos = outer_tclass;
+	iph->tot_len = htons(skb->len);
+	iph->frag_off = htons(IP_DF);
+	iph->ttl = outer_hoplimit;
+	iph->protocol = IPPROTO_UDP;
+	iph->saddr = v4_sa;
+	iph->daddr = v4_da;
+	__ip_select_ident(net, iph, 1);
+	iph->check = 0;
+	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
+
+	skb->protocol = htons(ETH_P_IP);
+	nf_reset_ct(skb);
+	skb_dst_drop(skb);
+
+	/* Resolve the egress route on the input path and hand the packet
+	 * to dst_input() so it traverses NF_INET_PRE_ROUTING and
+	 * NF_INET_FORWARD like every other transformed MUP packet,
+	 * keeping iptables/nftables FORWARD rules effective.  The IPv4
+	 * source is synthesised from the IPv6 SA and has no reverse
+	 * route, so operators must disable rp_filter on the ingress
+	 * device (net.ipv4.conf.<dev>.rp_filter=0) for this behavior.
+	 */
+	reason = ip_route_input(skb, v4_da, v4_sa,
+				inet_dsfield_to_dscp(outer_tclass), skb->dev);
+	if (reason) {
+		kfree_skb_reason(skb, reason);
+		return -EINVAL;
+	}
+	return dst_input(skb);
+}
+
+/* decapsulate the SRv6 outer and emit IPv4/UDP/GTPv1-U */
+static int input_action_end_m_gtp4_e(struct sk_buff *skb,
+				     struct seg6_mobile_lwt *slwt)
+{
+	enum seg6_mobile_srh_state srh_state;
+	struct net *net = dev_net(skb->dev);
+	struct ipv6_sr_hdr *srh;
+	unsigned int outer_len;
+	struct in6_addr ip6_sa;
+	struct ipv6hdr *ip6h;
+	__be32 v4_da, v4_sa;
+	__be16 inner_proto;
+	u8 outer_hoplimit;
+	__be16 frag_off;
+	u8 outer_tclass;
+	u64 args_mob;
+	u32 teid;
+	int off;
+	u8 qfi;
+	u8 nh;
+
+	if (!pskb_may_pull(skb, sizeof(*ip6h)))
+		goto drop;
+
+	ip6h = ipv6_hdr(skb);
+	ip6_sa = ip6h->saddr;
+	outer_tclass = ipv6_get_dsfield(ip6h);
+	outer_hoplimit = ip6h->hop_limit;
+
+	seg6_mobile_parse_gtp4_sid(&ip6h->daddr, slwt->sr_prefix_len,
+				   &v4_da, &args_mob);
+
+	srh = seg6_mobile_get_and_validate_srh(skb, &srh_state);
+	if (srh_state == SEG6_MOBILE_SRH_MALFORMED)
+		goto drop;
+	if (srh && srh->segments_left != 0)
+		goto drop;
+
+	/* @ip6h may have been invalidated by pskb_may_pull() inside
+	 * seg6_mobile_get_and_validate_srh(); re-evaluate before any
+	 * further dereference.
+	 */
+	ip6h = ipv6_hdr(skb);
+
+	teid = seg6_mobile_teid_from_args(args_mob);
+	qfi = seg6_mobile_qfi_from_args(args_mob);
+	v4_sa = seg6_mobile_v4_sa(&ip6_sa, slwt->v6_src_prefix_len);
+
+	nh = ip6h->nexthdr;
+	off = ipv6_skip_exthdr(skb, sizeof(*ip6h), &nh, &frag_off);
+	if (off < 0 || frag_off)
+		goto drop;
+	outer_len = off;
+
+	/* Only an inner IP PDU (the encapsulated T-PDU) can be GSO and thus
+	 * needs UDP-tunnel offload set up before encapsulation; any other
+	 * upper-layer payload is shipped without it.
+	 */
+	switch (nh) {
+	case IPPROTO_IPIP:
+		inner_proto = htons(ETH_P_IP);
+		break;
+	case IPPROTO_IPV6:
+		inner_proto = htons(ETH_P_IPV6);
+		break;
+	default:
+		inner_proto = 0;
+		break;
+	}
+
+	skb_pull_rcsum(skb, outer_len);
+	skb_reset_network_header(skb);
+	skb_reset_transport_header(skb);
+
+	if (seg6_mobile_xmit_gtp4_e(net, skb, slwt, v4_sa, v4_da, teid, qfi,
+				    inner_proto, outer_tclass, outer_hoplimit))
+		return -EINVAL;
+	return 0;
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
+/* Cross-attribute sanity check shared by the GTP4 actions (End.M.GTP4.E
+ * and H.M.GTP4.D).  Both fit two fields into the 128-bit IPv6 address:
+ *  - the IPv4 source template, anchored at the Source UPF Prefix length P
+ *    (= the configured v6_src_prefix_len, or
+ *    SEG6_MOBILE_V6_SRC_PREFIX_LEN_DEFAULT when unset), needs P + 32 bits;
+ *  - the SID locator (sr_prefix_len), the 32-bit IPv4 DA, and the 40-bit
+ *    Args.Mob.Session must together fit in 128 bits.
+ */
+static int seg6_mobile_v4_validate(struct seg6_mobile_lwt *slwt,
+				   struct netlink_ext_ack *extack)
+{
+	u8 p_bits = slwt->v6_src_prefix_len ? :
+		    SEG6_MOBILE_V6_SRC_PREFIX_LEN_DEFAULT;
+
+	if (p_bits + 32 > 128) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile v6_src_prefix_len must leave room for the 32-bit IPv4 source template (prefix_len <= 96)");
+		return -EINVAL;
+	}
+
+	if (slwt->sr_prefix_len + 32 + SEG6_MOBILE_ARGS_MOB_LEN > 128) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile sr_prefix_len + 32 (IPv4 DA) + 40 (Args.Mob.Session) must not exceed 128");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* End.M.GTP4.E is a downlink interworking behavior toward a legacy gNB, so
+ * it only carries downlink T-PDUs.  Restrict it to PDU Type 0 (downlink);
+ * the uplink PDU Type is served by the End.M.GTP6.E family.  The common
+ * parser already rejects the reserved 2..15 values.
+ */
+static int seg6_mobile_end_m_gtp4_e_validate(struct seg6_mobile_lwt *slwt,
+					     struct netlink_ext_ack *extack)
+{
+	int err;
+
+	err = seg6_mobile_v4_validate(slwt, extack);
+	if (err < 0)
+		return err;
+
+	if (slwt->pdu_type_set && slwt->pdu_type != 0) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile End.M.GTP4.E supports PDU Type 0 (DL) only");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int parse_nla_nh6(struct nlattr **attrs, struct seg6_mobile_lwt *slwt,
 			 struct netlink_ext_ack *extack)
 {
@@ -290,6 +671,102 @@ static int put_nla_nh6(struct sk_buff *skb, struct seg6_mobile_lwt *slwt)
 static int cmp_nla_nh6(struct seg6_mobile_lwt *a, struct seg6_mobile_lwt *b)
 {
 	return memcmp(&a->nh6, &b->nh6, sizeof(struct in6_addr));
+}
+
+static int parse_nla_pdu_type(struct nlattr **attrs,
+			      struct seg6_mobile_lwt *slwt,
+			      struct netlink_ext_ack *extack)
+{
+	u8 t = nla_get_u8(attrs[SEG6_MOBILE_PDU_TYPE]);
+
+	/* Only PDU Type 0 (downlink) and 1 (uplink) are defined; 2..15
+	 * are reserved.  Reject reserved values rather than writing them
+	 * onto the wire, since the UAPI cannot be tightened after merge.
+	 */
+	if (t > 0x1) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile PDU Type must be 0 (DL) or 1 (UL); 2..15 are reserved");
+		return -EINVAL;
+	}
+	slwt->pdu_type = t;
+	slwt->pdu_type_set = true;
+	return 0;
+}
+
+static int put_nla_pdu_type(struct sk_buff *skb,
+			    struct seg6_mobile_lwt *slwt)
+{
+	if (nla_put_u8(skb, SEG6_MOBILE_PDU_TYPE, slwt->pdu_type))
+		return -EMSGSIZE;
+	return 0;
+}
+
+static int cmp_nla_pdu_type(struct seg6_mobile_lwt *a,
+			    struct seg6_mobile_lwt *b)
+{
+	return a->pdu_type != b->pdu_type;
+}
+
+static int parse_nla_v6_src_prefix_len(struct nlattr **attrs,
+				       struct seg6_mobile_lwt *slwt,
+				       struct netlink_ext_ack *extack)
+{
+	u8 len = nla_get_u8(attrs[SEG6_MOBILE_V6_SRC_PREFIX_LEN]);
+
+	if (len == 0 || len > 127) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile v6_src_prefix_len must be in 1..127");
+		return -EINVAL;
+	}
+	slwt->v6_src_prefix_len = len;
+	return 0;
+}
+
+static int put_nla_v6_src_prefix_len(struct sk_buff *skb,
+				     struct seg6_mobile_lwt *slwt)
+{
+	if (nla_put_u8(skb, SEG6_MOBILE_V6_SRC_PREFIX_LEN,
+		       slwt->v6_src_prefix_len))
+		return -EMSGSIZE;
+	return 0;
+}
+
+static int cmp_nla_v6_src_prefix_len(struct seg6_mobile_lwt *a,
+				     struct seg6_mobile_lwt *b)
+{
+	return a->v6_src_prefix_len != b->v6_src_prefix_len;
+}
+
+static int parse_nla_sr_prefix_len(struct nlattr **attrs,
+				   struct seg6_mobile_lwt *slwt,
+				   struct netlink_ext_ack *extack)
+{
+	u8 len = nla_get_u8(attrs[SEG6_MOBILE_SR_PREFIX_LEN]);
+
+	/* The locator must be non-zero and leave room for the 40-bit
+	 * Args.Mob.Session that the behavior stamps right after it.
+	 */
+	if (len == 0 || len + SEG6_MOBILE_ARGS_MOB_LEN > 128) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile sr_prefix_len must be in 1..88 (leaving room for the 40-bit Args.Mob.Session)");
+		return -EINVAL;
+	}
+	slwt->sr_prefix_len = len;
+	return 0;
+}
+
+static int put_nla_sr_prefix_len(struct sk_buff *skb,
+				 struct seg6_mobile_lwt *slwt)
+{
+	if (nla_put_u8(skb, SEG6_MOBILE_SR_PREFIX_LEN, slwt->sr_prefix_len))
+		return -EMSGSIZE;
+	return 0;
+}
+
+static int cmp_nla_sr_prefix_len(struct seg6_mobile_lwt *a,
+				 struct seg6_mobile_lwt *b)
+{
+	return a->sr_prefix_len != b->sr_prefix_len;
 }
 
 static const struct
@@ -407,6 +884,15 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 		.optattrs	= SEG6_F_MOBILE_COUNTERS,
 		.input		= input_action_end_map,
 	},
+	{
+		.action		= SEG6_MOBILE_ACTION_END_M_GTP4_E,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V6_SRC_PREFIX_LEN),
+		.input		= input_action_end_m_gtp4_e,
+		.validate	= seg6_mobile_end_m_gtp4_e_validate,
+	},
 };
 
 static const struct seg6_mobile_action_param
@@ -422,13 +908,31 @@ seg6_mobile_action_params[SEG6_MOBILE_MAX + 1] = {
 		.cmp		= cmp_nla_counters,
 		.destroy	= destroy_attr_counters,
 	},
+	[SEG6_MOBILE_PDU_TYPE] = {
+		.parse	= parse_nla_pdu_type,
+		.put	= put_nla_pdu_type,
+		.cmp	= cmp_nla_pdu_type,
+	},
+	[SEG6_MOBILE_V6_SRC_PREFIX_LEN] = {
+		.parse	= parse_nla_v6_src_prefix_len,
+		.put	= put_nla_v6_src_prefix_len,
+		.cmp	= cmp_nla_v6_src_prefix_len,
+	},
+	[SEG6_MOBILE_SR_PREFIX_LEN] = {
+		.parse	= parse_nla_sr_prefix_len,
+		.put	= put_nla_sr_prefix_len,
+		.cmp	= cmp_nla_sr_prefix_len,
+	},
 };
 
 static const struct nla_policy
 seg6_mobile_policy[SEG6_MOBILE_MAX + 1] = {
-	[SEG6_MOBILE_ACTION]	= { .type = NLA_U32 },
-	[SEG6_MOBILE_NH6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
-	[SEG6_MOBILE_COUNTERS]	= { .type = NLA_NESTED },
+	[SEG6_MOBILE_ACTION]		= { .type = NLA_U32 },
+	[SEG6_MOBILE_NH6]		= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+	[SEG6_MOBILE_COUNTERS]		= { .type = NLA_NESTED },
+	[SEG6_MOBILE_PDU_TYPE]		= { .type = NLA_U8 },
+	[SEG6_MOBILE_V6_SRC_PREFIX_LEN]	= { .type = NLA_U8 },
+	[SEG6_MOBILE_SR_PREFIX_LEN]	= { .type = NLA_U8 },
 };
 
 static const struct seg6_mobile_action_desc *
@@ -609,6 +1113,15 @@ static int seg6_mobile_build_state(struct net *net, struct nlattr *nla,
 		return err;
 	}
 
+	if (desc->validate) {
+		err = desc->validate(slwt, extack);
+		if (err < 0) {
+			destroy_attrs(slwt);
+			kfree(newts);
+			return err;
+		}
+	}
+
 	newts->type = LWTUNNEL_ENCAP_SEG6_MOBILE;
 	newts->flags = LWTUNNEL_STATE_INPUT_REDIRECT;
 
@@ -658,6 +1171,12 @@ static int seg6_mobile_get_encap_size(struct lwtunnel_state *lwt)
 	attrs = slwt->desc->attrs | slwt->parsed_optattrs;
 	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_NH6))
 		nlsize += nla_total_size(sizeof(struct in6_addr));
+
+	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE))
+		nlsize += nla_total_size(sizeof(u8));
+
+	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V6_SRC_PREFIX_LEN))
+		nlsize += nla_total_size(sizeof(u8));
 
 	if (attrs & SEG6_F_MOBILE_COUNTERS)
 		nlsize += nla_total_size(0) + /* nest SEG6_MOBILE_COUNTERS */
