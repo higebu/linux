@@ -41,10 +41,11 @@ struct rh_fixed {
 
 static_assert(sizeof(struct rh_fixed) == 8, "rh_fixed must be 8 bytes");
 
-/* the largest packet built here: a one-segment type 0 Routing Header,
- * a two-segment SRH and a TCP header
+/* the largest packet built here: a Hop-by-Hop Options header, a
+ * one-segment type 0 Routing Header, a two-segment SRH and a TCP header
  */
-#define END_MAP_PKT_MAX	(sizeof(struct ip6_hdr) + \
+#define HBH_LEN		8
+#define END_MAP_PKT_MAX	(sizeof(struct ip6_hdr) + HBH_LEN + \
 			 2 * sizeof(struct rh_fixed) + \
 			 3 * sizeof(struct in6_addr) + sizeof(struct tcphdr))
 
@@ -67,6 +68,7 @@ struct cfg {
 	bool		no_next_header;
 	bool		no_rh;
 	bool		pre_rh0;
+	bool		hbh_ra;
 };
 
 static void usage(const char *bin)
@@ -87,6 +89,7 @@ static void usage(const char *bin)
 		"  --segment <addr>    Routing Header segment (default: the destination)\n"
 		"  --l4 <proto>        icmp (echo, default), udp or tcp (SYN)\n"
 		"  --l4-len <n>        truncate the L4 header to n bytes\n"
+		"  --hbh-ra            prepend a Hop-by-Hop Router Alert option\n"
 		"\n"
 		"Exit: 0 sent, 1 failure, 3 invalid arguments.\n",
 		bin);
@@ -150,6 +153,7 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 		{ "segment",         required_argument, NULL, OPT_SEGMENT },
 		{ "l4",              required_argument, NULL, OPT_L4 },
 		{ "l4-len",          required_argument, NULL, OPT_L4_LEN },
+		{ "hbh-ra",          no_argument, NULL, 'H' },
 		{ NULL, 0, NULL, 0 },
 	};
 	uint32_t v;
@@ -205,6 +209,9 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			if (parse_u32(optarg, &v) || v > sizeof(struct tcphdr))
 				return -1;
 			cfg->l4_len = v;
+			break;
+		case 'H':
+			cfg->hbh_ra = true;
 			break;
 		default:
 			return -1;
@@ -353,7 +360,17 @@ static int send_end_map(const struct cfg *cfg)
 		goto send;
 	}
 
+	if (cfg->hbh_ra) {
+		*nexthdr = IPPROTO_HOPOPTS;
+		nexthdr = &buf[off];
+		buf[off + 2] = 5;	/* Router Alert (RFC 2711), value 0 */
+		buf[off + 3] = 2;
+		buf[off + 6] = 1;	/* PadN */
+		off += HBH_LEN;
+	}
+
 	if (cfg->pre_rh0) {
+
 		*nexthdr = IPPROTO_ROUTING;
 		nexthdr = &buf[off];
 		put_rh(buf, &off, 0, 0, 0, false, &cfg->dst6, &cfg->dst6);
