@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Helper for the End.MAP selftest that crafts and sends an IPv6 packet
- * with a deliberately malformed Segment Routing Header (Routing Header
- * type = 0 instead of 4).  seg6_validate_srh() must reject the chain,
- * causing End.MAP to drop the packet on the forwarder.
+ * Subsystem-wide helper for SRv6 Mobile (RFC 9433) selftests.  Crafts
+ * and sends an IPv6 packet with a deliberately malformed Segment
+ * Routing Header (Routing Header type = 0 instead of 4) to the
+ * caller-supplied destination.  seg6_validate_srh() must reject the
+ * chain, causing the SRv6 Mobile handler at the destination to drop
+ * the packet on the forwarder.
  *
- * Usage: srv6_end_map_send <src-addr> <dst-addr>
+ * Usage: srv6_mobile_send <src-addr> <dst-addr>
  */
 
 #include <arpa/inet.h>

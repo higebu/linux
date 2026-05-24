@@ -45,7 +45,7 @@ readonly END_MAP_SID="2001:db8:f::1"
 readonly SRUPF3_SID="2001:db8:3::3"
 HELPER_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly HELPER_DIR
-readonly HELPER="${HELPER_DIR}/srv6_end_map_send"
+readonly HELPER="${HELPER_DIR}/srv6_mobile_send"
 
 ret=0
 nsuccess=0
