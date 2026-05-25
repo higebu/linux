@@ -219,6 +219,18 @@ int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh, int proto)
 }
 EXPORT_SYMBOL_GPL(seg6_do_srh_encap);
 
+/* same as seg6_do_srh_encap(), but let the caller pin the outer source
+ * address instead of deferring to set_tun_src()'s per-route / per-netns /
+ * RFC 6724 selection -- for callers that already know the final source
+ * address and would otherwise have it computed only to discard it.
+ */
+int seg6_do_srh_encap_tunsrc(struct sk_buff *skb, struct ipv6_sr_hdr *osrh,
+			     int proto, struct in6_addr *route_tunsrc)
+{
+	return __seg6_do_srh_encap(skb, osrh, proto, NULL, route_tunsrc);
+}
+EXPORT_SYMBOL_GPL(seg6_do_srh_encap_tunsrc);
+
 /* encapsulate an IPv6 packet within an outer IPv6 header with reduced SRH */
 static int seg6_do_srh_encap_red(struct sk_buff *skb,
 				 struct ipv6_sr_hdr *osrh, int proto,
