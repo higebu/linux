@@ -20,6 +20,7 @@
 #include <net/gso.h>
 #include <net/gtp.h>
 #include <net/ip.h>
+#include <net/ip6_checksum.h>
 #include <net/ip6_route.h>
 #include <net/ipv6.h>
 #include <net/lwtunnel.h>
@@ -640,6 +641,164 @@ drop:
 	return -EINVAL;
 }
 
+/* Build the outer IPv6 + UDP + GTPv1-U[+PDU Session] header chain on
+ * @skb and ship it via the IPv6 output path.  The IPv6 outer and its
+ * extension headers must already have been popped.  The pseudo-header
+ * sum is seeded here and CHECKSUM_PARTIAL is used so the stack or NIC
+ * can complete the mandatory UDPv6 checksum.
+ */
+static int seg6_mobile_xmit_gtp6_e(struct net *net, struct sk_buff *skb,
+				   struct seg6_mobile_lwt *slwt,
+				   const struct in6_addr *v6_sa,
+				   const struct in6_addr *v6_da, u32 teid,
+				   u8 qfi, u8 outer_tclass, u8 outer_hoplimit,
+				   __be32 flowlabel)
+{
+	struct dst_entry *dst;
+	struct ipv6hdr *ip6h;
+	struct flowi6 fl6;
+	struct udphdr *uh;
+	unsigned int len;
+
+	if (skb_cow_head(skb,
+			 sizeof(*ip6h) + sizeof(*uh) +
+			 sizeof(struct gtp1_header_long) +
+			 sizeof(struct seg6_mobile_pdu_session_ext)))
+		return -ENOMEM;
+
+	if (seg6_mobile_push_gtpu(skb, teid, qfi, slwt->pdu_type,
+				  slwt->pdu_type_set))
+		return -ENOMEM;
+
+	uh = skb_push(skb, sizeof(*uh));
+	skb_reset_transport_header(skb);
+	uh->source = htons(GTP1U_PORT);
+	uh->dest = htons(GTP1U_PORT);
+	uh->len = htons(skb->len);
+
+	ip6h = skb_push(skb, sizeof(*ip6h));
+	skb_reset_network_header(skb);
+	memset(ip6h, 0, sizeof(*ip6h));
+	ip6_flow_hdr(ip6h, outer_tclass, flowlabel);
+	len = skb->len - sizeof(*ip6h);
+	ip6h->payload_len = htons(len);
+	ip6h->nexthdr = IPPROTO_UDP;
+	ip6h->hop_limit = outer_hoplimit;
+	ip6h->saddr = *v6_sa;
+	ip6h->daddr = *v6_da;
+
+	/* UDP checksum over IPv6 must be non-zero.  Seed the pseudo-header
+	 * sum and let the stack or the NIC complete it through
+	 * CHECKSUM_PARTIAL; if the linear path folds the checksum to zero,
+	 * udp6_set_csum() substitutes 0xffff.
+	 */
+	skb->ip_summed = CHECKSUM_PARTIAL;
+	skb->csum_start = (unsigned char *)uh - skb->head;
+	skb->csum_offset = offsetof(struct udphdr, check);
+	uh->check = ~csum_ipv6_magic(v6_sa, v6_da, len, IPPROTO_UDP, 0);
+
+	skb->protocol = htons(ETH_P_IPV6);
+	nf_reset_ct(skb);
+	skb_dst_drop(skb);
+
+	memset(&fl6, 0, sizeof(fl6));
+	fl6.daddr = *v6_da;
+	fl6.saddr = *v6_sa;
+	fl6.flowi6_proto = IPPROTO_UDP;
+
+	dst = ip6_route_output(net, NULL, &fl6);
+	if (dst->error) {
+		int err = dst->error;
+
+		dst_release(dst);
+		return err;
+	}
+	skb_dst_set(skb, dst);
+	return dst_output(net, NULL, skb);
+}
+
+/* terminate the SRv6 packet and emit IPv6/UDP/GTPv1-U toward the SRH's
+ * next segment, recovering TEID/QFI from the current SID.
+ */
+static int input_action_end_m_gtp6_e(struct sk_buff *skb,
+				     struct seg6_mobile_lwt *slwt)
+{
+	enum seg6_mobile_srh_state srh_state;
+	struct net *net = dev_net(skb->dev);
+	unsigned int outer_len, locator_bits;
+	struct ipv6_sr_hdr *srh;
+	struct in6_addr ip6_da;
+	struct ipv6hdr *ip6h;
+	u8 outer_hoplimit;
+	__be32 flowlabel;
+	__be16 frag_off;
+	u8 outer_tclass;
+	u64 args_mob;
+	u32 teid;
+	int off;
+	u8 qfi;
+	u8 nh;
+
+	srh = seg6_mobile_get_and_validate_srh(skb, &srh_state);
+	if (srh_state != SEG6_MOBILE_SRH_PRESENT)
+		goto drop;
+
+	/* End.M.GTP6.E is always the penultimate segment; active only
+	 * when segments_left == 1.
+	 */
+	if (srh->segments_left != 1)
+		goto drop;
+
+	if (!pskb_may_pull(skb, sizeof(*ip6h)))
+		goto drop;
+
+	ip6h = ipv6_hdr(skb);
+	locator_bits = seg6_mobile_skb_prefix_bits(skb);
+	if (locator_bits + SEG6_MOBILE_ARGS_MOB_LEN > 128)
+		goto drop;
+
+	args_mob = seg6_mobile_addr_get_bits(ip6h->daddr.s6_addr,
+					     locator_bits,
+					     SEG6_MOBILE_ARGS_MOB_LEN);
+	teid = seg6_mobile_teid_from_args(args_mob);
+	qfi = seg6_mobile_qfi_from_args(args_mob);
+	ip6_da = srh->segments[0];
+	outer_tclass = ipv6_get_dsfield(ip6h);
+	outer_hoplimit = ip6h->hop_limit;
+	flowlabel = ip6_flowlabel(ip6h);
+
+	nh = ip6h->nexthdr;
+	off = ipv6_skip_exthdr(skb, sizeof(*ip6h), &nh, &frag_off);
+	if (off < 0)
+		goto drop;
+	outer_len = off;
+
+	if (skb_is_gso(skb)) {
+		unsigned int ovhd = sizeof(struct ipv6hdr) + sizeof(struct udphdr) +
+				    sizeof(struct gtp1_header_long) +
+				    sizeof(struct seg6_mobile_pdu_session_ext);
+		unsigned int mtu = dst_mtu(skb_dst(skb));
+
+		if (mtu && (mtu <= ovhd ||
+			    !skb_gso_validate_network_len(skb, mtu - ovhd)))
+			goto drop;
+	}
+
+	skb_pull_rcsum(skb, outer_len);
+	skb_reset_network_header(skb);
+	skb_reset_transport_header(skb);
+
+	if (seg6_mobile_xmit_gtp6_e(net, skb, slwt, &slwt->src_addr, &ip6_da,
+				    teid, qfi, outer_tclass, outer_hoplimit,
+				    flowlabel))
+		return -EINVAL;
+	return 0;
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* Cross-attribute sanity check for actions that synthesise an IPv4
  * source from the IPv6 source: the Source UPF Prefix length P (= the
  * configured v6_src_prefix_len, or
@@ -915,6 +1074,13 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V6_SRC_PREFIX_LEN),
 		.input		= input_action_end_m_gtp4_e,
 		.validate	= seg6_mobile_v4_validate,
+	},
+	{
+		.action		= SEG6_MOBILE_ACTION_END_M_GTP6_E,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE),
+		.input		= input_action_end_m_gtp6_e,
 	},
 };
 
