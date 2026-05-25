@@ -19,6 +19,7 @@
 #include <net/dsfield.h>
 #include <net/gtp.h>
 #include <net/ip.h>
+#include <net/ip6_checksum.h>
 #include <net/ip6_route.h>
 #include <net/ip_tunnels.h>
 #include <net/ipv6.h>
@@ -88,6 +89,7 @@ struct seg6_mobile_counters {
 struct seg6_mobile_lwt {
 	int action;
 	struct in6_addr nh6;
+	struct in6_addr src_addr;
 	u8 pdu_type;
 	bool pdu_type_set;
 	u8 v6_src_prefix_len;
@@ -601,6 +603,185 @@ drop:
 	return -EINVAL;
 }
 
+/* Build the outer IPv6 + UDP + GTPv1-U[+PDU Session] header chain on
+ * @skb and ship it via the IPv6 input path.  The IPv6 outer and its
+ * extension headers must already have been popped.  The pseudo-header
+ * sum is seeded here and CHECKSUM_PARTIAL is used so the stack or NIC
+ * can complete the mandatory UDPv6 checksum.
+ */
+static int seg6_mobile_xmit_gtp6_e(struct sk_buff *skb,
+				   struct seg6_mobile_lwt *slwt,
+				   const struct in6_addr *v6_sa,
+				   const struct in6_addr *v6_da, u32 teid,
+				   u8 qfi, __be16 inner_proto, u8 outer_tclass,
+				   u8 outer_hoplimit, __be32 flowlabel)
+{
+	unsigned int inner_nhlen;
+	struct ipv6hdr *ip6h;
+	struct udphdr *uh;
+	unsigned int len;
+	int err;
+
+	if (skb_cow_head(skb,
+			 sizeof(*ip6h) + sizeof(*uh) +
+			 sizeof(struct gtp1_header_long) +
+			 sizeof(struct seg6_mobile_pdu_session_ext)))
+		return -ENOMEM;
+
+	/* A GSO T-PDU must be re-segmented through the UDP-tunnel path once
+	 * the outer IPv6/UDP/GTP-U chain is prepended, otherwise the GSO
+	 * engine cannot find the inner transport header and drops it.  Mark
+	 * the skb encapsulated and snapshot the inner IP headers so the
+	 * segmenter emits one GTP-U packet per inner segment.  The outer
+	 * UDPv6 checksum is mandatory, so request SKB_GSO_UDP_TUNNEL_CSUM and
+	 * let skb_udp_tunnel_segment() complete it per segment.  Non-GSO
+	 * T-PDUs need none of this and are shipped as-is.
+	 */
+	if (inner_proto && skb_is_gso(skb)) {
+		if (inner_proto == htons(ETH_P_IP)) {
+			if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+				return -ENOMEM;
+			inner_nhlen = ip_hdrlen(skb);
+		} else {
+			inner_nhlen = sizeof(struct ipv6hdr);
+		}
+		skb_set_transport_header(skb, inner_nhlen);
+		skb_reset_mac_header(skb);
+		err = iptunnel_handle_offloads(skb, SKB_GSO_UDP_TUNNEL_CSUM);
+		if (err)
+			return err;
+		skb_set_inner_protocol(skb, inner_proto);
+	}
+
+	seg6_mobile_push_gtpu(skb, teid, qfi, slwt->pdu_type,
+			      slwt->pdu_type_set);
+
+	uh = skb_push(skb, sizeof(*uh));
+	skb_reset_transport_header(skb);
+	uh->source = htons(GTP1U_PORT);
+	uh->dest = htons(GTP1U_PORT);
+	uh->len = htons(skb->len);
+
+	ip6h = skb_push(skb, sizeof(*ip6h));
+	skb_reset_network_header(skb);
+	memset(ip6h, 0, sizeof(*ip6h));
+	ip6_flow_hdr(ip6h, outer_tclass, flowlabel);
+	len = skb->len - sizeof(*ip6h);
+	ip6h->payload_len = htons(len);
+	ip6h->nexthdr = IPPROTO_UDP;
+	ip6h->hop_limit = outer_hoplimit;
+	ip6h->saddr = *v6_sa;
+	ip6h->daddr = *v6_da;
+
+	/* UDP checksum over IPv6 must be non-zero.  udp6_set_csum() seeds
+	 * the pseudo-header sum: a GSO skb keeps its inner CHECKSUM_PARTIAL
+	 * offload intact and skb_udp_tunnel_segment() folds the outer
+	 * checksum per segment; a non-GSO skb hands the outer checksum to
+	 * the stack or NIC via CHECKSUM_PARTIAL (or resolves an inner
+	 * CHECKSUM_PARTIAL via local checksum offload).
+	 */
+	udp6_set_csum(false, skb, v6_sa, v6_da, len);
+
+	skb->protocol = htons(ETH_P_IPV6);
+	nf_reset_ct(skb);
+
+	/* Resolve the egress route on the input path and hand the packet
+	 * to dst_input() so it traverses NF_INET_PRE_ROUTING and
+	 * NF_INET_FORWARD like every other transformed MUP packet,
+	 * keeping ip6tables/nftables FORWARD rules effective.  The outer
+	 * IPv6 source is the operator-configured slwt->src_addr with a
+	 * normal reverse route, so unlike End.M.GTP4.E this needs no
+	 * rp_filter relaxation.
+	 */
+	ip6_route_input(skb);
+	return dst_input(skb);
+}
+
+/* terminate the SRv6 packet and emit IPv6/UDP/GTPv1-U */
+static int input_action_end_m_gtp6_e(struct sk_buff *skb,
+				     struct seg6_mobile_lwt *slwt)
+{
+	enum seg6_mobile_srh_state srh_state;
+	struct ipv6_sr_hdr *srh;
+	unsigned int outer_len;
+	struct in6_addr ip6_da;
+	struct ipv6hdr *ip6h;
+	__be16 inner_proto;
+	u8 outer_hoplimit;
+	__be32 flowlabel;
+	__be16 frag_off;
+	u8 outer_tclass;
+	u64 args_mob;
+	u32 teid;
+	int off;
+	u8 qfi;
+	u8 nh;
+
+	srh = seg6_mobile_get_and_validate_srh(skb, &srh_state);
+	if (srh_state != SEG6_MOBILE_SRH_PRESENT)
+		goto drop;
+
+	/* End.M.GTP6.E is always the penultimate segment; active only
+	 * when segments_left == 1.
+	 */
+	if (srh->segments_left != 1)
+		goto drop;
+
+	if (!pskb_may_pull(skb, sizeof(*ip6h)))
+		goto drop;
+
+	ip6h = ipv6_hdr(skb);
+
+	/* parse_nla_sr_prefix_len() guarantees the locator leaves room
+	 * for the 40-bit Args.Mob.Session.
+	 */
+	args_mob = seg6_mobile_addr_get_bits(ip6h->daddr.s6_addr,
+					     slwt->sr_prefix_len,
+					     SEG6_MOBILE_ARGS_MOB_LEN);
+	teid = seg6_mobile_teid_from_args(args_mob);
+	qfi = seg6_mobile_qfi_from_args(args_mob);
+	ip6_da = srh->segments[0];
+	outer_tclass = ipv6_get_dsfield(ip6h);
+	outer_hoplimit = ip6h->hop_limit;
+	flowlabel = ip6_flowlabel(ip6h);
+
+	nh = ip6h->nexthdr;
+	off = ipv6_skip_exthdr(skb, sizeof(*ip6h), &nh, &frag_off);
+	if (off < 0 || frag_off)
+		goto drop;
+	outer_len = off;
+
+	/* Only an inner IP PDU (the encapsulated T-PDU) can be GSO and thus
+	 * needs UDP-tunnel offload set up before encapsulation; any other
+	 * upper-layer payload is shipped without it.
+	 */
+	switch (nh) {
+	case IPPROTO_IPIP:
+		inner_proto = htons(ETH_P_IP);
+		break;
+	case IPPROTO_IPV6:
+		inner_proto = htons(ETH_P_IPV6);
+		break;
+	default:
+		inner_proto = 0;
+		break;
+	}
+
+	skb_pull_rcsum(skb, outer_len);
+	skb_reset_network_header(skb);
+	skb_reset_transport_header(skb);
+
+	if (seg6_mobile_xmit_gtp6_e(skb, slwt, &slwt->src_addr, &ip6_da,
+				    teid, qfi, inner_proto, outer_tclass,
+				    outer_hoplimit, flowlabel))
+		return -EINVAL;
+	return 0;
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* Cross-attribute sanity check shared by the GTP4 actions (End.M.GTP4.E
  * and H.M.GTP4.D).  Both fit two fields into the 128-bit IPv6 address:
  *  - the IPv4 source template, anchored at the Source UPF Prefix length P
@@ -671,6 +852,29 @@ static int put_nla_nh6(struct sk_buff *skb, struct seg6_mobile_lwt *slwt)
 static int cmp_nla_nh6(struct seg6_mobile_lwt *a, struct seg6_mobile_lwt *b)
 {
 	return memcmp(&a->nh6, &b->nh6, sizeof(struct in6_addr));
+}
+
+static int parse_nla_src_addr(struct nlattr **attrs,
+			      struct seg6_mobile_lwt *slwt,
+			      struct netlink_ext_ack *extack)
+{
+	memcpy(&slwt->src_addr, nla_data(attrs[SEG6_MOBILE_SRC_ADDR]),
+	       sizeof(struct in6_addr));
+	return 0;
+}
+
+static int put_nla_src_addr(struct sk_buff *skb,
+			    struct seg6_mobile_lwt *slwt)
+{
+	if (nla_put_in6_addr(skb, SEG6_MOBILE_SRC_ADDR, &slwt->src_addr))
+		return -EMSGSIZE;
+	return 0;
+}
+
+static int cmp_nla_src_addr(struct seg6_mobile_lwt *a,
+			    struct seg6_mobile_lwt *b)
+{
+	return memcmp(&a->src_addr, &b->src_addr, sizeof(struct in6_addr));
 }
 
 static int parse_nla_pdu_type(struct nlattr **attrs,
@@ -893,6 +1097,14 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 		.input		= input_action_end_m_gtp4_e,
 		.validate	= seg6_mobile_end_m_gtp4_e_validate,
 	},
+	{
+		.action		= SEG6_MOBILE_ACTION_END_M_GTP6_E,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE),
+		.input		= input_action_end_m_gtp6_e,
+	},
 };
 
 static const struct seg6_mobile_action_param
@@ -907,6 +1119,11 @@ seg6_mobile_action_params[SEG6_MOBILE_MAX + 1] = {
 		.put		= put_nla_counters,
 		.cmp		= cmp_nla_counters,
 		.destroy	= destroy_attr_counters,
+	},
+	[SEG6_MOBILE_SRC_ADDR] = {
+		.parse	= parse_nla_src_addr,
+		.put	= put_nla_src_addr,
+		.cmp	= cmp_nla_src_addr,
 	},
 	[SEG6_MOBILE_PDU_TYPE] = {
 		.parse	= parse_nla_pdu_type,
@@ -930,6 +1147,7 @@ seg6_mobile_policy[SEG6_MOBILE_MAX + 1] = {
 	[SEG6_MOBILE_ACTION]		= { .type = NLA_U32 },
 	[SEG6_MOBILE_NH6]		= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[SEG6_MOBILE_COUNTERS]		= { .type = NLA_NESTED },
+	[SEG6_MOBILE_SRC_ADDR]		= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[SEG6_MOBILE_PDU_TYPE]		= { .type = NLA_U8 },
 	[SEG6_MOBILE_V6_SRC_PREFIX_LEN]	= { .type = NLA_U8 },
 	[SEG6_MOBILE_SR_PREFIX_LEN]	= { .type = NLA_U8 },
@@ -1170,6 +1388,9 @@ static int seg6_mobile_get_encap_size(struct lwtunnel_state *lwt)
 
 	attrs = slwt->desc->attrs | slwt->parsed_optattrs;
 	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_NH6))
+		nlsize += nla_total_size(sizeof(struct in6_addr));
+
+	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR))
 		nlsize += nla_total_size(sizeof(struct in6_addr));
 
 	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE))
