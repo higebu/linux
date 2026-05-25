@@ -311,8 +311,8 @@ test_srh_malformed()
 
 	before=$(read_route_errors)
 
-	ip netns exec "$rt1" "$HELPER" 2001:db8:1::1 "$END_MAP_SID" \
-		>/dev/null 2>&1
+	ip netns exec "$rt1" "$HELPER" -m end-map \
+		-s 2001:db8:1::1 -d "$END_MAP_SID" >/dev/null 2>&1
 
 	after=$(read_route_errors)
 	[ "$((after - before))" -eq 1 ] || rc=1
