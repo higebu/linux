@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/udp.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -55,6 +56,7 @@ struct pdu_session_ext {
 enum mode {
 	MODE_NONE,
 	MODE_GTP4_E,
+	MODE_GTP6_E,
 };
 
 struct cfg {
@@ -62,6 +64,8 @@ struct cfg {
 	enum mode	mode;
 	struct in_addr	src4;
 	struct in_addr	dst4;
+	struct in6_addr	src6;
+	struct in6_addr	dst6;
 	uint32_t	teid;
 	uint8_t		qfi;
 	uint8_t		pdu_type;
@@ -76,6 +80,7 @@ static void usage(const char *bin)
 "\n"
 "Modes:\n"
 "  gtp4-e      End.M.GTP4.E (IPv4/UDP/GTPv1-U[/PDU Session]/inner)\n"
+"  gtp6-e      End.M.GTP6.E (IPv6/UDP/GTPv1-U[/PDU Session]/inner)\n"
 "\n"
 "Common options:\n"
 "  -i <iface>          interface to bind AF_PACKET to\n"
@@ -84,7 +89,7 @@ static void usage(const char *bin)
 "  -d <dst>            expected outer destination address\n"
 "  -T <timeout-ms>     receive wait window (default 1500)\n"
 "\n"
-"Mode gtp4-e options:\n"
+"Mode gtp4-e / gtp6-e options:\n"
 "  -t <teid>           expected GTP-U TEID (decimal or 0xHEX)\n"
 "  -q <qfi>            expected QFI (when --pdu-session)\n"
 "  -P <pdu-type>       expected PDU Type (when --pdu-session)\n"
@@ -121,6 +126,8 @@ static enum mode parse_mode(const char *s)
 {
 	if (!strcmp(s, "gtp4-e"))
 		return MODE_GTP4_E;
+	if (!strcmp(s, "gtp6-e"))
+		return MODE_GTP6_E;
 	return MODE_NONE;
 }
 
@@ -144,12 +151,22 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			cfg->mode = parse_mode(optarg);
 			break;
 		case 's':
-			if (inet_pton(AF_INET, optarg, &cfg->src4) != 1)
-				return -1;
+			if (cfg->mode == MODE_GTP6_E) {
+				if (inet_pton(AF_INET6, optarg, &cfg->src6) != 1)
+					return -1;
+			} else {
+				if (inet_pton(AF_INET, optarg, &cfg->src4) != 1)
+					return -1;
+			}
 			break;
 		case 'd':
-			if (inet_pton(AF_INET, optarg, &cfg->dst4) != 1)
-				return -1;
+			if (cfg->mode == MODE_GTP6_E) {
+				if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
+					return -1;
+			} else {
+				if (inet_pton(AF_INET, optarg, &cfg->dst4) != 1)
+					return -1;
+			}
 			break;
 		case 'T':
 			if (parse_u32(optarg, (uint32_t *)&cfg->timeout_ms))
@@ -179,25 +196,19 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 	return 0;
 }
 
-static bool match_gtp4_e(const uint8_t *buf, size_t len, const struct cfg *cfg)
+/* Match the UDP + GTPv1-U[+PDU Session] portion of the packet
+ * starting at @off bytes into @buf.  Both End.M.GTP4.E and
+ * End.M.GTP6.E share this format; only the outer IP header differs.
+ */
+static bool match_udp_gtpu(const uint8_t *buf, size_t len, size_t off,
+			   const struct cfg *cfg)
 {
 	const struct pdu_session_ext *ps;
 	const struct gtp1_hdr_long *gtphl;
 	const struct gtp1_hdr *gtph;
 	const struct udphdr *uh;
-	const struct iphdr *iph;
-	size_t off = 0;
 	uint8_t flags_exp;
 	size_t gtp_hsz;
-
-	if (len < sizeof(*iph))
-		return false;
-	iph = (const void *)(buf + off);
-	if (iph->version != 4 || iph->protocol != IPPROTO_UDP)
-		return false;
-	if (iph->saddr != cfg->src4.s_addr || iph->daddr != cfg->dst4.s_addr)
-		return false;
-	off += iph->ihl * 4;
 
 	if (len < off + sizeof(*uh))
 		return false;
@@ -238,6 +249,35 @@ static bool match_gtp4_e(const uint8_t *buf, size_t len, const struct cfg *cfg)
 	return true;
 }
 
+static bool match_gtp4_e(const uint8_t *buf, size_t len, const struct cfg *cfg)
+{
+	const struct iphdr *iph;
+
+	if (len < sizeof(*iph))
+		return false;
+	iph = (const void *)buf;
+	if (iph->version != 4 || iph->protocol != IPPROTO_UDP)
+		return false;
+	if (iph->saddr != cfg->src4.s_addr || iph->daddr != cfg->dst4.s_addr)
+		return false;
+	return match_udp_gtpu(buf, len, iph->ihl * 4, cfg);
+}
+
+static bool match_gtp6_e(const uint8_t *buf, size_t len, const struct cfg *cfg)
+{
+	const struct ipv6hdr *ip6h;
+
+	if (len < sizeof(*ip6h))
+		return false;
+	ip6h = (const void *)buf;
+	if (ip6h->version != 6 || ip6h->nexthdr != IPPROTO_UDP)
+		return false;
+	if (memcmp(&ip6h->saddr, &cfg->src6, sizeof(ip6h->saddr)) ||
+	    memcmp(&ip6h->daddr, &cfg->dst6, sizeof(ip6h->daddr)))
+		return false;
+	return match_udp_gtpu(buf, len, sizeof(*ip6h), cfg);
+}
+
 static int elapsed_ms(const struct timespec *t0)
 {
 	struct timespec now;
@@ -261,7 +301,8 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+	fd = socket(AF_PACKET, SOCK_DGRAM,
+		    htons(cfg.mode == MODE_GTP6_E ? ETH_P_IPV6 : ETH_P_IP));
 	if (fd < 0) {
 		perror("socket(AF_PACKET)");
 		return 3;
@@ -308,6 +349,11 @@ int main(int argc, char **argv)
 		seen = true;
 		if (cfg.mode == MODE_GTP4_E &&
 		    match_gtp4_e(buf, (size_t)n, &cfg)) {
+			close(fd);
+			return 0;
+		}
+		if (cfg.mode == MODE_GTP6_E &&
+		    match_gtp6_e(buf, (size_t)n, &cfg)) {
 			close(fd);
 			return 0;
 		}
