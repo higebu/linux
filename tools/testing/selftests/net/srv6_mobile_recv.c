@@ -57,6 +57,8 @@ enum mode {
 	MODE_NONE,
 	MODE_GTP4_E,
 	MODE_GTP6_E,
+	MODE_GTP6_D,
+	MODE_GTP6_PASSTHRU,
 };
 
 struct cfg {
@@ -66,6 +68,8 @@ struct cfg {
 	struct in_addr	dst4;
 	struct in6_addr	src6;
 	struct in6_addr	dst6;
+	struct in6_addr	last_sid;
+	bool		last_sid_set;
 	uint32_t	teid;
 	uint8_t		qfi;
 	uint8_t		pdu_type;
@@ -79,8 +83,10 @@ static void usage(const char *bin)
 "Usage: %s -i <iface> -m <mode> -s <src> -d <dst> [opts]\n"
 "\n"
 "Modes:\n"
-"  gtp4-e      End.M.GTP4.E (IPv4/UDP/GTPv1-U[/PDU Session]/inner)\n"
-"  gtp6-e      End.M.GTP6.E (IPv6/UDP/GTPv1-U[/PDU Session]/inner)\n"
+"  gtp4-e         End.M.GTP4.E (IPv4/UDP/GTPv1-U[/PDU Session]/inner)\n"
+"  gtp6-e         End.M.GTP6.E (IPv6/UDP/GTPv1-U[/PDU Session]/inner)\n"
+"  gtp6-d         End.M.GTP6.D (IPv6/SRH/inner with stamped Args.Mob.Session)\n"
+"  gtp6-passthru  match an unmodified IPv6/UDP/GTPv1-U arrival\n"
 "\n"
 "Common options:\n"
 "  -i <iface>          interface to bind AF_PACKET to\n"
@@ -94,6 +100,9 @@ static void usage(const char *bin)
 "  -q <qfi>            expected QFI (when --pdu-session)\n"
 "  -P <pdu-type>       expected PDU Type (when --pdu-session)\n"
 "  --pdu-session       expect GTPv1-U long header + PDU Session ext\n"
+"\n"
+"Mode gtp6-d options:\n"
+"  -L <last-sid>       expected SRH[0] with Args.Mob.Session stamped\n"
 "\n"
 "Exit: 0 match, 1 mismatch, 2 timeout, 3 usage error.\n",
 	bin);
@@ -128,7 +137,16 @@ static enum mode parse_mode(const char *s)
 		return MODE_GTP4_E;
 	if (!strcmp(s, "gtp6-e"))
 		return MODE_GTP6_E;
+	if (!strcmp(s, "gtp6-d"))
+		return MODE_GTP6_D;
+	if (!strcmp(s, "gtp6-passthru"))
+		return MODE_GTP6_PASSTHRU;
 	return MODE_NONE;
+}
+
+static bool mode_is_v6_outer(enum mode m)
+{
+	return m == MODE_GTP6_E || m == MODE_GTP6_D || m == MODE_GTP6_PASSTHRU;
 }
 
 static int parse_args(int argc, char **argv, struct cfg *cfg)
@@ -141,7 +159,7 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 	int c;
 
 	cfg->timeout_ms = 1500;
-	while ((c = getopt_long(argc, argv, "i:m:s:d:T:t:q:P:",
+	while ((c = getopt_long(argc, argv, "i:m:s:d:L:T:t:q:P:",
 				longopts, NULL)) != -1) {
 		switch (c) {
 		case 'i':
@@ -151,7 +169,7 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			cfg->mode = parse_mode(optarg);
 			break;
 		case 's':
-			if (cfg->mode == MODE_GTP6_E) {
+			if (mode_is_v6_outer(cfg->mode)) {
 				if (inet_pton(AF_INET6, optarg, &cfg->src6) != 1)
 					return -1;
 			} else {
@@ -160,13 +178,18 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			}
 			break;
 		case 'd':
-			if (cfg->mode == MODE_GTP6_E) {
+			if (mode_is_v6_outer(cfg->mode)) {
 				if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
 					return -1;
 			} else {
 				if (inet_pton(AF_INET, optarg, &cfg->dst4) != 1)
 					return -1;
 			}
+			break;
+		case 'L':
+			if (inet_pton(AF_INET6, optarg, &cfg->last_sid) != 1)
+				return -1;
+			cfg->last_sid_set = true;
 			break;
 		case 'T':
 			if (parse_u32(optarg, (uint32_t *)&cfg->timeout_ms))
@@ -278,6 +301,85 @@ static bool match_gtp6_e(const uint8_t *buf, size_t len, const struct cfg *cfg)
 	return match_udp_gtpu(buf, len, sizeof(*ip6h), cfg);
 }
 
+/* Match an unmodified IPv6/UDP/GTPv1-U arrival, used to verify that
+ * a packet which falls outside End.M.GTP6.D's T-PDU encapsulation path
+ * (non-T-PDU GTP-U, or non-UDP outer) was forwarded verbatim via the
+ * lwtunnel's saved orig_input.  TEID / QFI / GTP message type are not
+ * checked; the test only asserts the packet reached @iface with the
+ * expected outer addresses.
+ */
+static bool match_gtp6_passthru(const uint8_t *buf, size_t len,
+				const struct cfg *cfg)
+{
+	const struct ipv6hdr *ip6h;
+	const struct udphdr *uh;
+
+	if (len < sizeof(*ip6h) + sizeof(*uh))
+		return false;
+	ip6h = (const void *)buf;
+	if (ip6h->version != 6 || ip6h->nexthdr != IPPROTO_UDP)
+		return false;
+	if (memcmp(&ip6h->saddr, &cfg->src6, sizeof(ip6h->saddr)) ||
+	    memcmp(&ip6h->daddr, &cfg->dst6, sizeof(ip6h->daddr)))
+		return false;
+	uh = (const void *)(buf + sizeof(*ip6h));
+	return ntohs(uh->dest) == GTP1U_PORT;
+}
+
+/* IPv6 routing header layout per RFC 8200 / RFC 8754 SRH. */
+struct rthdr_min {
+	uint8_t		next_header;
+	uint8_t		hdr_ext_len;	/* in 8-byte units, not counting first 8 */
+	uint8_t		routing_type;
+	uint8_t		segments_left;
+	uint8_t		first_segment;
+	uint8_t		flags;
+	uint16_t	tag;
+	struct in6_addr	segments[];
+} __attribute__((packed));
+
+#define SRH_TYPE	4
+
+/* Match an SRv6 packet emitted by End.M.GTP6.D: outer SA/DA equal the
+ * configured src/dst, NH chain reaches an SRH whose SRH[0] (the last
+ * SID in path order, segments[0] in Linux's network-order layout)
+ * carries the expected Args.Mob.Session-stamped value supplied via -L.
+ */
+static bool match_gtp6_d(const uint8_t *buf, size_t len, const struct cfg *cfg)
+{
+	const struct rthdr_min *rt;
+	const struct ipv6hdr *ip6h;
+	size_t off;
+
+	if (len < sizeof(*ip6h))
+		return false;
+	ip6h = (const void *)buf;
+	if (ip6h->version != 6)
+		return false;
+	if (memcmp(&ip6h->saddr, &cfg->src6, sizeof(ip6h->saddr)) ||
+	    memcmp(&ip6h->daddr, &cfg->dst6, sizeof(ip6h->daddr)))
+		return false;
+	if (ip6h->nexthdr != IPPROTO_ROUTING)
+		return false;
+
+	off = sizeof(*ip6h);
+	if (len < off + sizeof(*rt))
+		return false;
+	rt = (const void *)(buf + off);
+	if (rt->routing_type != SRH_TYPE)
+		return false;
+	/* The SRH allocated by seg6_do_srh_encap() leaves segments[0] as
+	 * the last SID in path order; that is the slot End.M.GTP6.D stamps
+	 * Args.Mob.Session into.
+	 */
+	if (len < off + 8 + sizeof(struct in6_addr))
+		return false;
+	if (cfg->last_sid_set &&
+	    memcmp(&rt->segments[0], &cfg->last_sid, sizeof(struct in6_addr)))
+		return false;
+	return true;
+}
+
 static int elapsed_ms(const struct timespec *t0)
 {
 	struct timespec now;
@@ -302,7 +404,7 @@ int main(int argc, char **argv)
 	}
 
 	fd = socket(AF_PACKET, SOCK_DGRAM,
-		    htons(cfg.mode == MODE_GTP6_E ? ETH_P_IPV6 : ETH_P_IP));
+		    htons(mode_is_v6_outer(cfg.mode) ? ETH_P_IPV6 : ETH_P_IP));
 	if (fd < 0) {
 		perror("socket(AF_PACKET)");
 		return 3;
@@ -346,7 +448,28 @@ int main(int argc, char **argv)
 			return 3;
 		}
 
-		seen = true;
+		/* "seen" only counts arrivals from the configured outer
+		 * source, so MLD reports / Router Solicitations / ND
+		 * solicits that happen on the same wire do not turn a
+		 * clean drop into a noisy "seen" return.
+		 */
+		if (mode_is_v6_outer(cfg.mode)) {
+			const struct ipv6hdr *ip6h = (const void *)buf;
+
+			if (n >= (ssize_t)sizeof(*ip6h) &&
+			    ip6h->version == 6 &&
+			    !memcmp(&ip6h->saddr, &cfg.src6,
+				    sizeof(ip6h->saddr)))
+				seen = true;
+		} else {
+			const struct iphdr *iph = (const void *)buf;
+
+			if (n >= (ssize_t)sizeof(*iph) &&
+			    iph->version == 4 &&
+			    iph->saddr == cfg.src4.s_addr)
+				seen = true;
+		}
+
 		if (cfg.mode == MODE_GTP4_E &&
 		    match_gtp4_e(buf, (size_t)n, &cfg)) {
 			close(fd);
@@ -354,6 +477,16 @@ int main(int argc, char **argv)
 		}
 		if (cfg.mode == MODE_GTP6_E &&
 		    match_gtp6_e(buf, (size_t)n, &cfg)) {
+			close(fd);
+			return 0;
+		}
+		if (cfg.mode == MODE_GTP6_D &&
+		    match_gtp6_d(buf, (size_t)n, &cfg)) {
+			close(fd);
+			return 0;
+		}
+		if (cfg.mode == MODE_GTP6_PASSTHRU &&
+		    match_gtp6_passthru(buf, (size_t)n, &cfg)) {
 			close(fd);
 			return 0;
 		}
