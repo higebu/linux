@@ -302,8 +302,8 @@ test_srh_malformed()
 
 	before=$(read_nstat_counter "$srupf3" Icmp6InCsumErrors)
 
-	ip netns exec "$srupf1" "$HELPER" 2001:db8:1::1 "$END_MAP_SID" \
-		>/dev/null 2>&1
+	ip netns exec "$srupf1" "$HELPER" -m end-map \
+		-s 2001:db8:1::1 -d "$END_MAP_SID" >/dev/null 2>&1
 
 	# Give the kernel a brief moment to forward (or drop) the packet
 	# before sampling the counter.
