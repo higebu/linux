@@ -6,6 +6,8 @@
  *
  * Usage:
  *   srv6_mobile_send -m end-map -s <src> -d <dst> [--rh-type N] [--bad-srh]
+ *   srv6_mobile_send -m gtp6-d  -s <src> -d <dst> [-t TEID] [-q QFI]
+ *                              [-P PDU_TYPE] [--echo] [--malformed]
  */
 
 #include <arpa/inet.h>
@@ -15,6 +17,7 @@
 #include <netinet/in.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
+#include <netinet/udp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,6 +26,17 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#define GTP1U_PORT		2152
+
+/* GTPv1-U mandatory header flags: Version=1 (bits 7..5 = 001) +
+ * Protocol Type=1 (bit 4); E/S/PN are zero in the base.
+ */
+#define GTP1U_FLAGS_BASE	0x30
+#define GTP1U_F_EXTHDR		0x04
+#define GTP1U_TPDU		0xff
+#define GTP1U_ECHO_REQ		0x01
+#define GTP1U_NH_PDU_SESSION	0x85
 
 /* RFC 8200 Routing header common fields are 4 bytes; an additional
  * 4 bytes of type-specific data follow (the Reserved field for the
@@ -51,16 +65,46 @@ static_assert(sizeof(struct end_map_frame) ==
 	      sizeof(struct icmp6_hdr),
 	      "end_map_frame must not contain padding");
 
+struct gtp1_hdr {
+	uint8_t  flags;
+	uint8_t  type;
+	uint16_t length;
+	uint32_t tid;
+} __attribute__((packed));
+
+struct gtp1_hdr_long {
+	struct gtp1_hdr	base;
+	uint16_t	seq;
+	uint8_t		npdu;
+	uint8_t		next;
+} __attribute__((packed));
+
+struct pdu_session_ext {
+	uint8_t ext_len;
+	uint8_t pdu_type_spare;
+	uint8_t spare_qfi;
+	uint8_t next_ext;
+} __attribute__((packed));
+
 enum mode {
 	MODE_NONE,
 	MODE_END_MAP,
+	MODE_GTP6_D,
 };
 
 struct cfg {
 	enum mode	mode;
 	struct in6_addr	src6;
 	struct in6_addr	dst6;
+	uint32_t	teid;
+	uint8_t		qfi;
+	uint8_t		pdu_type;
 	uint8_t		rh_type;
+	bool		pdu_session_set;
+	bool		echo;
+	bool		malformed;
+	bool		frag;
+	bool		dup_pdu_session;
 	bool		bad_srh;
 };
 
@@ -71,10 +115,21 @@ static void usage(const char *bin)
 		"\n"
 		"Modes:\n"
 		"  end-map    Send IPv6 + SRH + ICMPv6 echo for End.MAP testing\n"
+		"  gtp6-d     Send IPv6 + UDP + GTPv1-U[+PDU Session] for End.M.GTP6.D testing\n"
 		"\n"
 		"Mode end-map options:\n"
 		"  --rh-type <n>       Routing Header type (default 4, the SRH)\n"
 		"  --bad-srh           emit an SRH whose Last Entry exceeds its length (drop test)\n"
+		"\n"
+		"Mode gtp6-d options:\n"
+		"  -t <teid>           GTP-U TEID (decimal or 0xHEX), default 0x123\n"
+		"  -q <qfi>            QFI (requires --pdu-session)\n"
+		"  -P <pdu-type>       PDU Type (requires --pdu-session)\n"
+		"  --pdu-session       emit GTPv1-U long header + PDU Session extension\n"
+		"  --echo              emit a GTPv1-U Echo Request instead of T-PDU\n"
+		"  --malformed         emit an extension chain with ext_units=0 (drop test)\n"
+		"  --dup-pdu-session   emit two PDU Session extension headers (drop test)\n"
+		"  --frag              insert an IPv6 Fragment header (gtp6-d, drop test)\n"
 		"\n"
 		"Exit: 0 sent, 1 failure, 3 invalid arguments.\n",
 		bin);
@@ -107,21 +162,30 @@ static enum mode parse_mode(const char *s)
 {
 	if (!strcmp(s, "end-map"))
 		return MODE_END_MAP;
+	if (!strcmp(s, "gtp6-d"))
+		return MODE_GTP6_D;
 	return MODE_NONE;
 }
 
 static int parse_args(int argc, char **argv, struct cfg *cfg)
 {
-	enum { OPT_RH_TYPE = 256, OPT_BAD_SRH };
+	enum { OPT_PDU_SESSION = 256, OPT_ECHO, OPT_MALFORMED,
+	       OPT_DUP_PDU_SESSION, OPT_FRAG, OPT_RH_TYPE, OPT_BAD_SRH };
 	static const struct option longopts[] = {
+		{ "pdu-session",     no_argument, NULL, OPT_PDU_SESSION },
+		{ "echo",            no_argument, NULL, OPT_ECHO },
+		{ "malformed",       no_argument, NULL, OPT_MALFORMED },
+		{ "dup-pdu-session", no_argument, NULL, OPT_DUP_PDU_SESSION },
+		{ "frag",            no_argument, NULL, OPT_FRAG },
 		{ "rh-type",         required_argument, NULL, OPT_RH_TYPE },
 		{ "bad-srh",         no_argument, NULL, OPT_BAD_SRH },
 		{ NULL, 0, NULL, 0 },
 	};
 	int c;
 
+	cfg->teid = 0x123;
 	cfg->rh_type = 4;	/* RFC 8754: the SRH is Routing Header type 4 */
-	while ((c = getopt_long(argc, argv, "m:s:d:", longopts, NULL))
+	while ((c = getopt_long(argc, argv, "m:s:d:t:q:P:", longopts, NULL))
 	       != -1) {
 		switch (c) {
 		case 'm':
@@ -134,6 +198,33 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 		case 'd':
 			if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
 				return -1;
+			break;
+		case 't':
+			if (parse_u32(optarg, &cfg->teid))
+				return -1;
+			break;
+		case 'q':
+			if (parse_u8(optarg, &cfg->qfi))
+				return -1;
+			break;
+		case 'P':
+			if (parse_u8(optarg, &cfg->pdu_type))
+				return -1;
+			break;
+		case OPT_PDU_SESSION:
+			cfg->pdu_session_set = true;
+			break;
+		case OPT_ECHO:
+			cfg->echo = true;
+			break;
+		case OPT_MALFORMED:
+			cfg->malformed = true;
+			break;
+		case OPT_DUP_PDU_SESSION:
+			cfg->dup_pdu_session = true;
+			break;
+		case OPT_FRAG:
+			cfg->frag = true;
 			break;
 		case OPT_RH_TYPE:
 			if (parse_u8(optarg, &cfg->rh_type))
@@ -243,6 +334,154 @@ static int send_end_map(const struct cfg *cfg)
 	return 0;
 }
 
+#define INNER_PAYLOAD_LEN	16
+
+static int send_gtp6_d(const struct cfg *cfg)
+{
+	uint8_t frame[sizeof(struct ip6_hdr) + sizeof(struct ip6_frag) +
+		      sizeof(struct udphdr) + sizeof(struct gtp1_hdr_long) +
+		      2 * sizeof(struct pdu_session_ext) +
+		      sizeof(struct ip6_hdr) + INNER_PAYLOAD_LEN];
+	struct sockaddr_in6 dst_addr = { .sin6_family = AF_INET6 };
+	struct ip6_hdr *outer;
+	struct udphdr *uh;
+	uint8_t *gtp_buf;
+	struct ip6_hdr *inner;
+	struct icmp6_hdr inner_icmp = {};
+	size_t gtp_hdr_len, payload_off, frame_len, plen;
+	size_t l3_ext_len, udp_len;
+	ssize_t res;
+	int fd;
+
+	memset(frame, 0, sizeof(frame));
+	l3_ext_len = cfg->frag ? sizeof(struct ip6_frag) : 0;
+	outer = (struct ip6_hdr *)frame;
+	uh = (struct udphdr *)(frame + sizeof(*outer) + l3_ext_len);
+	gtp_buf = (uint8_t *)(uh + 1);
+
+	if (cfg->pdu_session_set) {
+		struct gtp1_hdr_long *gtphl = (struct gtp1_hdr_long *)gtp_buf;
+		struct pdu_session_ext *ps;
+
+		gtphl->base.flags = GTP1U_FLAGS_BASE | GTP1U_F_EXTHDR;
+		gtphl->base.type = cfg->echo ? GTP1U_ECHO_REQ : GTP1U_TPDU;
+		gtphl->base.tid = htonl(cfg->teid);
+		gtphl->seq = 0;
+		gtphl->npdu = 0;
+		gtphl->next = GTP1U_NH_PDU_SESSION;
+
+		ps = (struct pdu_session_ext *)(gtphl + 1);
+		ps->ext_len = cfg->malformed ? 0 : 1;
+		ps->pdu_type_spare = (cfg->pdu_type & 0xf) << 4;
+		ps->spare_qfi = cfg->qfi & 0x3f;
+		ps->next_ext = cfg->dup_pdu_session ? GTP1U_NH_PDU_SESSION : 0;
+
+		gtp_hdr_len = sizeof(*gtphl) + sizeof(*ps);
+
+		/* A T-PDU carries at most one PDU Session container; a
+		 * second one chained after the first must be rejected.
+		 */
+		if (cfg->dup_pdu_session) {
+			struct pdu_session_ext *ps2 = ps + 1;
+
+			ps2->ext_len = 1;
+			ps2->pdu_type_spare = (cfg->pdu_type & 0xf) << 4;
+			ps2->spare_qfi = cfg->qfi & 0x3f;
+			ps2->next_ext = 0;
+			gtp_hdr_len += sizeof(*ps2);
+		}
+	} else {
+		struct gtp1_hdr *gtph = (struct gtp1_hdr *)gtp_buf;
+
+		gtph->flags = GTP1U_FLAGS_BASE;
+		gtph->type = cfg->echo ? GTP1U_ECHO_REQ : GTP1U_TPDU;
+		gtph->tid = htonl(cfg->teid);
+		gtp_hdr_len = sizeof(*gtph);
+	}
+
+	payload_off = sizeof(*outer) + l3_ext_len + sizeof(*uh) + gtp_hdr_len;
+
+	if (cfg->echo) {
+		/* GTP-U Echo carries no inner IP payload. */
+		((struct gtp1_hdr *)gtp_buf)->length = htons(gtp_hdr_len -
+							     sizeof(struct gtp1_hdr));
+		frame_len = payload_off;
+	} else {
+		/* Inner IPv6 + ICMPv6 echo as the encapsulated T-PDU. */
+		inner = (struct ip6_hdr *)(frame + payload_off);
+		inner->ip6_flow = htonl(6u << 28);
+		inner->ip6_plen = htons(sizeof(inner_icmp));
+		inner->ip6_nxt = IPPROTO_ICMPV6;
+		inner->ip6_hops = 64;
+		if (inet_pton(AF_INET6, "2001:db8:100::1", &inner->ip6_src) != 1 ||
+		    inet_pton(AF_INET6, "2001:db8:100::2", &inner->ip6_dst) != 1)
+			return 1;
+
+		inner_icmp.icmp6_type = ICMP6_ECHO_REQUEST;
+		inner_icmp.icmp6_dataun.icmp6_un_data16[0] = htons(0xdead);
+		inner_icmp.icmp6_dataun.icmp6_un_data16[1] = htons(1);
+		inner_icmp.icmp6_cksum = pseudo_csum(&inner->ip6_src,
+						     &inner->ip6_dst,
+						     sizeof(inner_icmp),
+						     IPPROTO_ICMPV6,
+						     &inner_icmp,
+						     sizeof(inner_icmp));
+
+		memcpy(inner + 1, &inner_icmp, sizeof(inner_icmp));
+
+		frame_len = payload_off + sizeof(*inner) + sizeof(inner_icmp);
+		((struct gtp1_hdr *)gtp_buf)->length =
+			htons(frame_len - payload_off + gtp_hdr_len -
+			      sizeof(struct gtp1_hdr));
+	}
+
+	outer->ip6_flow = htonl(6u << 28);
+	plen = frame_len - sizeof(*outer);
+	outer->ip6_plen = htons(plen);
+	outer->ip6_nxt = cfg->frag ? IPPROTO_FRAGMENT : IPPROTO_UDP;
+	outer->ip6_hops = 64;
+	outer->ip6_src = cfg->src6;
+	outer->ip6_dst = cfg->dst6;
+
+	if (cfg->frag) {
+		struct ip6_frag *frag = (struct ip6_frag *)(outer + 1);
+
+		frag->ip6f_nxt = IPPROTO_UDP;
+		frag->ip6f_reserved = 0;
+		/* offset 0 with the More Fragments flag set, so
+		 * ipv6_skip_exthdr() reports a nonzero frag_off.
+		 */
+		frag->ip6f_offlg = htons(0x0001);
+		frag->ip6f_ident = htonl(0xf00dface);
+	}
+
+	udp_len = plen - l3_ext_len;
+	uh->source = htons(GTP1U_PORT);
+	uh->dest = htons(GTP1U_PORT);
+	uh->len = htons(udp_len);
+	uh->check = 0;
+	uh->check = pseudo_csum(&outer->ip6_src, &outer->ip6_dst, udp_len,
+				IPPROTO_UDP, uh, udp_len);
+	if (!uh->check)
+		uh->check = 0xffff;
+
+	fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+	if (fd < 0) {
+		perror("socket");
+		return 1;
+	}
+	dst_addr.sin6_addr = outer->ip6_dst;
+
+	res = sendto(fd, frame, frame_len, 0,
+		     (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+	close(fd);
+	if (res != (ssize_t)frame_len) {
+		perror("sendto");
+		return 1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct cfg cfg = {};
@@ -255,6 +494,8 @@ int main(int argc, char **argv)
 	switch (cfg.mode) {
 	case MODE_END_MAP:
 		return send_end_map(&cfg);
+	case MODE_GTP6_D:
+		return send_gtp6_d(&cfg);
 	default:
 		usage(argv[0]);
 		return 3;
