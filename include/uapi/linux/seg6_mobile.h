@@ -31,6 +31,8 @@ enum {
 	SEG6_MOBILE_ACTION_END_M_GTP6_E	= 3,
 	/* IPv6/GTP-U decap into SR Policy */
 	SEG6_MOBILE_ACTION_END_M_GTP6_D	= 4,
+	/* IPv6/GTP-U drop-in decap into SR Policy */
+	SEG6_MOBILE_ACTION_END_M_GTP6_D_DI	= 5,
 
 	__SEG6_MOBILE_ACTION_MAX,
 };
