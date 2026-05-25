@@ -16,10 +16,16 @@
  * in instead: each must carry one segment with matching UDP and GTP-U
  * lengths, a correct TCP checksum and the payload bytes sent.
  *
+ * With -U it sends @nsegs G-PDUs to <addr> in one UDP_SEGMENT send, so that
+ * a D behavior gets them as one UDP GSO skb.  Each carries a UDP datagram
+ * of @seg bytes from <src6> to <dst6>.
+ *
  * Usage: srv6_mobile_gso_send -i <iface> -D <dmac> -s <src6> -d <dst6>
  *                             -S <seg> -n <nsegs>
  *        srv6_mobile_gso_send -c -i <iface> -S <seg> -n <nsegs>
  *                             [-T <timeout-ms>] [-r <path>]
+ *        srv6_mobile_gso_send -U -A <addr> -s <src6> -d <dst6>
+ *                             -S <seg> -n <nsegs>
  */
 
 #include <arpa/inet.h>
@@ -44,6 +50,10 @@
 
 #define GTP1U_PORT	2152
 
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT	103
+#endif
+
 struct cfg {
 	const char	*iface;
 	uint8_t		dmac[ETH_ALEN];
@@ -52,6 +62,8 @@ struct cfg {
 	int		seg;
 	int		nsegs;
 	bool		check;
+	bool		udp_gso;
+	struct sockaddr_storage	addr;
 	int		timeout_ms;
 	const char	*ready_path;
 };
@@ -61,6 +73,7 @@ static void usage(const char *bin)
 	fprintf(stderr,
 "Usage: %s -i <iface> -D <dmac> -s <src6> -d <dst6> -S <seg> -n <nsegs>\n"
 "       %s -c -i <iface> -S <seg> -n <nsegs> [-T <timeout-ms>] [-r <path>]\n"
+"       %s -U -A <addr> -s <src6> -d <dst6> -S <seg> -n <nsegs>\n"
 "\n"
 "  -i <iface>   interface to inject the TSO frame on\n"
 "  -D <dmac>    next-hop destination MAC (aa:bb:cc:dd:ee:ff)\n"
@@ -71,9 +84,11 @@ static void usage(const char *bin)
 "  -c           check the GTP-U packets on <iface> instead of sending\n"
 "  -T <ms>      check: wait window (default 2000)\n"
 "  -r <path>    check: write \"ready\" to <path> once bound\n"
+"  -U           send @nsegs G-PDUs to <addr> as one UDP GSO packet\n"
+"  -A <addr>    -U: IPv4 or IPv6 GTP-U destination\n"
 "\n"
 "Exit: 0 sent / all segments intact, 1 failure, 3 usage error.\n",
-		bin, bin);
+		bin, bin, bin);
 }
 
 static int parse_mac(const char *s, uint8_t *mac)
@@ -103,13 +118,38 @@ static uint16_t csum_fold(uint32_t sum)
 	return ~sum;
 }
 
+static int parse_addr(const char *s, struct sockaddr_storage *ss)
+{
+	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+	struct sockaddr_in *sin = (struct sockaddr_in *)ss;
+
+	if (inet_pton(AF_INET, s, &sin->sin_addr) == 1) {
+		sin->sin_family = AF_INET;
+		sin->sin_port = htons(GTP1U_PORT);
+		return 0;
+	}
+	if (inet_pton(AF_INET6, s, &sin6->sin6_addr) == 1) {
+		sin6->sin6_family = AF_INET6;
+		sin6->sin6_port = htons(GTP1U_PORT);
+		return 0;
+	}
+	return -1;
+}
+
 static int parse_args(int argc, char **argv, struct cfg *cfg)
 {
 	int c;
 
 	cfg->timeout_ms = 2000;
-	while ((c = getopt(argc, argv, "ci:D:s:d:S:n:T:r:")) != -1) {
+	while ((c = getopt(argc, argv, "ci:D:s:d:S:n:T:r:UA:")) != -1) {
 		switch (c) {
+		case 'U':
+			cfg->udp_gso = true;
+			break;
+		case 'A':
+			if (parse_addr(optarg, &cfg->addr))
+				return -1;
+			break;
 		case 'c':
 			cfg->check = true;
 			break;
@@ -144,7 +184,7 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			return -1;
 		}
 	}
-	if (!cfg->iface || cfg->seg <= 0 || cfg->nsegs <= 0)
+	if ((!cfg->iface && !cfg->udp_gso) || cfg->seg <= 0 || cfg->nsegs <= 0)
 		return -1;
 	return 0;
 }
@@ -287,6 +327,79 @@ static int check(const struct cfg *cfg)
 	return good == cfg->nsegs && !bad ? 0 : 1;
 }
 
+/* each G-PDU is a short GTP-U header and an IPv6/UDP datagram whose
+ * payload bytes start at the G-PDU index
+ */
+static int send_udp_gso(const struct cfg *cfg)
+{
+	int gpdu = 8 + sizeof(struct ipv6hdr) + 8 + cfg->seg;
+	uint8_t *buf, *p, *data;
+	struct ipv6hdr *ip6;
+	uint16_t *uh;
+	uint32_t sum;
+	int fd, i, k;
+	ssize_t n;
+
+	buf = calloc(cfg->nsegs, gpdu);
+	if (!buf) {
+		perror("calloc");
+		return 1;
+	}
+	for (k = 0; k < cfg->nsegs; k++) {
+		p = buf + k * gpdu;
+		p[0] = 0x30;		/* GTPv1-U, short header */
+		p[1] = 0xff;		/* T-PDU */
+		*(uint16_t *)(p + 2) = htons(gpdu - 8);
+		*(uint32_t *)(p + 4) = htonl(0x123);
+
+		ip6 = (struct ipv6hdr *)(p + 8);
+		ip6->version = 6;
+		ip6->payload_len = htons(8 + cfg->seg);
+		ip6->nexthdr = IPPROTO_UDP;
+		ip6->hop_limit = 64;
+		ip6->saddr = cfg->src6;
+		ip6->daddr = cfg->dst6;
+
+		uh = (uint16_t *)(ip6 + 1);
+		uh[0] = htons(4242);
+		uh[1] = htons(9);	/* closed: the receiver answers */
+		uh[2] = htons(8 + cfg->seg);
+		data = (uint8_t *)(uh + 4);
+		for (i = 0; i < cfg->seg; i++)
+			data[i] = (uint8_t)(k + i);
+
+		sum = csum_partial(&ip6->saddr, sizeof(ip6->saddr), 0);
+		sum = csum_partial(&ip6->daddr, sizeof(ip6->daddr), sum);
+		sum += htons(8 + cfg->seg);
+		sum += htons(IPPROTO_UDP);
+		uh[3] = csum_fold(csum_partial(uh, 8 + cfg->seg, sum));
+		if (!uh[3])
+			uh[3] = 0xffff;
+	}
+
+	fd = socket(cfg->addr.ss_family, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		free(buf);
+		return 1;
+	}
+	if (setsockopt(fd, IPPROTO_UDP, UDP_SEGMENT, &gpdu, sizeof(gpdu))) {
+		perror("UDP_SEGMENT");
+		close(fd);
+		free(buf);
+		return 1;
+	}
+	n = sendto(fd, buf, cfg->nsegs * gpdu, 0, (struct sockaddr *)&cfg->addr,
+		   sizeof(cfg->addr));
+	close(fd);
+	free(buf);
+	if (n != cfg->nsegs * gpdu) {
+		perror("sendto");
+		return 1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct cfg cfg = {};
@@ -305,6 +418,8 @@ int main(int argc, char **argv)
 	}
 	if (cfg.check)
 		return check(&cfg);
+	if (cfg.udp_gso)
+		return send_udp_gso(&cfg);
 
 	payload = cfg.seg * cfg.nsegs;
 	frame_len = sizeof(*vh) + ETH_HLEN + sizeof(*ip6) + sizeof(*th) +
