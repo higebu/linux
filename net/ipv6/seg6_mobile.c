@@ -89,6 +89,11 @@ struct seg6_mobile_counters {
 struct seg6_mobile_lwt {
 	int action;
 	struct ipv6_sr_hdr *srh;
+	/* augmented SR Policy SRH allocated by End.M.GTP6.D.Di whose
+	 * extra leading slot will be stamped with the original outer
+	 * destination address per packet (RFC 9433 Section 6.4).
+	 */
+	struct ipv6_sr_hdr *aug_srh;
 	struct in6_addr nh6;
 	struct in6_addr src_addr;
 	u8 v4_mask_len;
@@ -1147,6 +1152,114 @@ drop:
 	return -EINVAL;
 }
 
+/* Build the augmented SR Policy SRH used by End.M.GTP6.D.Di.  An extra
+ * leading slot is reserved so the data path can stamp the original
+ * outer destination into segments[0] after seg6_do_srh_encap() pushes
+ * the SRH onto the freshly-encapsulated inner T-PDU.
+ */
+static int seg6_mobile_end_m_gtp6_d_di_validate(struct seg6_mobile_lwt *slwt,
+						struct netlink_ext_ack *extack)
+{
+	struct ipv6_sr_hdr *aug;
+	int orig_len, aug_len;
+
+	/* hdrlen is u8 and counts the SRH length in 8-byte units minus
+	 * one.  The augmented SRH adds one 16-byte segment, so reject
+	 * inputs whose +2-unit hdrlen would not fit.
+	 */
+	if (slwt->srh->hdrlen > 253) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile SRH too large for End.M.GTP6.D.Di (max 126 segments)");
+		return -EINVAL;
+	}
+
+	orig_len = (slwt->srh->hdrlen + 1) << 3;
+	aug_len = orig_len + sizeof(struct in6_addr);
+
+	aug = kzalloc(aug_len, GFP_KERNEL);
+	if (!aug)
+		return -ENOMEM;
+
+	memcpy(aug, slwt->srh, sizeof(*aug));
+	aug->hdrlen = (aug_len >> 3) - 1;
+	aug->segments_left = slwt->srh->segments_left + 1;
+	aug->first_segment = slwt->srh->first_segment + 1;
+	/* segments[0] is left zero; the data path overwrites it with
+	 * the original outer destination once seg6_do_srh_encap() has
+	 * copied the SRH into the skb.
+	 */
+	memcpy(&aug->segments[1], &slwt->srh->segments[0],
+	       orig_len - sizeof(*aug));
+
+	slwt->aug_srh = aug;
+	return 0;
+}
+
+/* End.M.GTP6.D.Di: drop-in variant of End.M.GTP6.D.  Receives an
+ * IPv6/UDP/GTPv1-U packet matching a locally-instantiated
+ * End.M.GTP6.D.Di SID and re-encapsulates the inner T-PDU in SRv6
+ * using the configured SR Policy augmented with a leading slot that
+ * preserves the original outer IPv6 destination.  Unlike End.M.GTP6.D,
+ * the GTP-U TEID and QFI are discarded so the Args.Mob.Session field
+ * of the SR domain stays unmodified -- the caller is dropped onto an
+ * existing SR path without rewriting the per-session identifiers.
+ *
+ * Non-T-PDU GTP-U and non-UDP upper layers fall back to the orig_input
+ * passthrough so the GTP-U control plane remains operable end-to-end.
+ */
+static int input_action_end_m_gtp6_d_di(struct sk_buff *skb,
+					struct seg6_mobile_lwt *slwt)
+{
+	struct ipv6_sr_hdr *new_srh;
+	struct in6_addr orig_dst;
+	int inner_proto;
+	u32 teid;
+	int err;
+	u8 qfi;
+
+	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
+		goto drop;
+	orig_dst = ipv6_hdr(skb)->daddr;
+
+	err = seg6_mobile_decap_gtp6_outer(skb, &teid, &qfi, &inner_proto);
+	if (err == -EOPNOTSUPP)
+		return seg6_mobile_orig_input(skb);
+	if (err)
+		goto drop;
+
+	/* TEID and QFI are intentionally discarded so the SR domain
+	 * sees no per-session marking from this hop.
+	 */
+	(void)teid;
+	(void)qfi;
+
+	/* Push the augmented SRH onto the inner T-PDU; seg6_do_srh_encap
+	 * propagates TC / Flow Label / Hop Limit per RFC 6040 and sets
+	 * the outer DA to segments[first_segment].
+	 */
+	if (seg6_do_srh_encap(skb, slwt->aug_srh, inner_proto))
+		goto drop;
+
+	skb->protocol = htons(ETH_P_IPV6);
+
+	new_srh = (struct ipv6_sr_hdr *)(skb_network_header(skb) +
+					 sizeof(struct ipv6hdr));
+	/* Preserve the original outer destination in the prepended
+	 * leading slot (SRH[0] -- the last segment in path order) so
+	 * the SR domain delivers the packet to the same endpoint that
+	 * owned the address before the drop-in step.
+	 */
+	new_srh->segments[0] = orig_dst;
+	ipv6_hdr(skb)->saddr = slwt->src_addr;
+
+	nf_reset_ct(skb);
+	return seg6_mobile_forward(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* Cross-attribute sanity check for actions that synthesise an IPv4
  * source from the IPv6 source: the Source UPF Prefix length P (= the
  * configured v6_src_prefix_len, or
@@ -1355,6 +1468,11 @@ static int cmp_nla_srh(struct seg6_mobile_lwt *a, struct seg6_mobile_lwt *b)
 
 static void destroy_attr_srh(struct seg6_mobile_lwt *slwt)
 {
+	/* aug_srh is paired with srh: it is built from srh by the
+	 * End.M.GTP6.D.Di validate hook and is NULL for every other
+	 * action.
+	 */
+	kfree(slwt->aug_srh);
 	kfree(slwt->srh);
 }
 
@@ -1525,6 +1643,14 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
 		.optattrs	= SEG6_F_MOBILE_COUNTERS,
 		.input		= input_action_end_m_gtp6_d,
+	},
+	{
+		.action		= SEG6_MOBILE_ACTION_END_M_GTP6_D_DI,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS,
+		.input		= input_action_end_m_gtp6_d_di,
+		.validate	= seg6_mobile_end_m_gtp6_d_di_validate,
 	},
 };
 
