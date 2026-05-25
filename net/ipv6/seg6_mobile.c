@@ -91,6 +91,10 @@ struct seg6_mobile_counters {
 struct seg6_mobile_lwt {
 	int action;
 	struct ipv6_sr_hdr *srh;
+	/* augmented SR Policy SRH used by End.M.GTP6.D.Di; its extra
+	 * leading slot is stamped per-packet with the original outer DA.
+	 */
+	struct ipv6_sr_hdr *aug_srh;
 	struct in6_addr mapped_sid;
 	struct in6_addr src_addr;
 	u8 pdu_type;
@@ -1321,6 +1325,115 @@ drop:
 	return -EINVAL;
 }
 
+/* allocate the augmented SR Policy SRH used by End.M.GTP6.D.Di; the
+ * leading slot is stamped per-packet with the original outer DA.
+ */
+static int seg6_mobile_end_m_gtp6_d_di_validate(struct seg6_mobile_lwt *slwt,
+						struct netlink_ext_ack *extack)
+{
+	struct ipv6_sr_hdr *aug;
+	int orig_len, aug_len;
+
+	/* hdrlen is u8 and counts the SRH length in 8-byte units minus
+	 * one.  The augmented SRH adds one 16-byte segment, so reject
+	 * inputs whose +2-unit hdrlen would not fit.
+	 */
+	if (slwt->srh->hdrlen > 253) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile SRH too large for End.M.GTP6.D.Di (max 126 segments)");
+		return -EINVAL;
+	}
+
+	orig_len = (slwt->srh->hdrlen + 1) << 3;
+	aug_len = orig_len + sizeof(struct in6_addr);
+
+	aug = kzalloc(aug_len, GFP_KERNEL);
+	if (!aug)
+		return -ENOMEM;
+
+	memcpy(aug, slwt->srh, sizeof(*aug));
+	aug->hdrlen = (aug_len >> 3) - 1;
+	aug->segments_left = slwt->srh->segments_left + 1;
+	aug->first_segment = slwt->srh->first_segment + 1;
+	/* segments[0] is left zero; the data path overwrites it with
+	 * the original outer destination once seg6_do_srh_encap() has
+	 * copied the SRH into the skb.
+	 */
+	memcpy(&aug->segments[1], &slwt->srh->segments[0],
+	       orig_len - sizeof(*aug));
+
+	slwt->aug_srh = aug;
+	return 0;
+}
+
+/* drop-in variant of End.M.GTP6.D that preserves the original outer DA at SRH[0] */
+static int input_action_end_m_gtp6_d_di(struct sk_buff *skb,
+					struct seg6_mobile_lwt *slwt)
+{
+	struct ipv6_sr_hdr *new_srh;
+	struct in6_addr orig_dst;
+	struct in6_addr last_sid;
+	int inner_proto;
+	u64 args_mob;
+	u8 tclass;
+	u32 teid;
+	int err;
+	u8 qfi;
+
+	if (skb_is_gso(skb))
+		return seg6_mobile_input_segs(skb, slwt,
+					      input_action_end_m_gtp6_d_di);
+
+	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
+		goto drop;
+	orig_dst = ipv6_hdr(skb)->daddr;
+	tclass = ipv6_get_dsfield(ipv6_hdr(skb));
+
+	err = seg6_mobile_decap_gtp6_outer(skb, &teid, &qfi, &inner_proto);
+	if (err == -EOPNOTSUPP)
+		return seg6_mobile_orig_input(skb);
+	if (err)
+		goto drop;
+
+	if (seg6_mobile_srh_reencap(skb, slwt->aug_srh, inner_proto,
+				    &slwt->src_addr))
+		goto drop;
+	seg6_mobile_set_outer(skb, tclass);
+
+	new_srh = (struct ipv6_sr_hdr *)(skb_network_header(skb) +
+					 sizeof(struct ipv6hdr));
+	/* preserve the original outer destination in the prepended slot
+	 * so the SR domain still delivers to the pre-drop-in endpoint.
+	 * The outer source address was already stamped by
+	 * seg6_mobile_srh_reencap().
+	 */
+	seg6_mobile_set_addr(skb, &new_srh->segments[0], &orig_dst);
+
+	/* with sr_prefix_len, the last SID of the SR Policy, now SRH[1],
+	 * carries the TEID and QFI as End.M.GTP6.D writes them, so that an
+	 * End.M.GTP6.E there can rebuild the GTP-U packet, as in the
+	 * drop-in mode of RFC 9433
+	 */
+	if (slwt->parsed_optattrs &
+	    SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN)) {
+		args_mob = seg6_mobile_args_from_teid_qfi(teid, qfi);
+		last_sid = new_srh->segments[1];
+		seg6_mobile_write_args_mob(&last_sid, slwt->sr_prefix_len,
+					   args_mob);
+		seg6_mobile_set_addr(skb, &new_srh->segments[1], &last_sid);
+		if (new_srh->first_segment == 1)
+			seg6_mobile_set_addr(skb, &ipv6_hdr(skb)->daddr,
+					     &last_sid);
+	}
+
+	nf_reset_ct(skb);
+	return seg6_mobile_forward(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* Cross-attribute sanity check shared by the GTP4 actions (End.M.GTP4.E
  * and H.M.GTP4.D).  Both fit two fields into the 128-bit IPv6 address:
  *  - the IPv4 source template, anchored at the Source UPF Prefix length
@@ -1541,6 +1654,11 @@ static int cmp_nla_srh(struct seg6_mobile_lwt *a, struct seg6_mobile_lwt *b)
 
 static void destroy_attr_srh(struct seg6_mobile_lwt *slwt)
 {
+	/* aug_srh is paired with srh: it is built from srh by the
+	 * End.M.GTP6.D.Di validate hook and is NULL for every other
+	 * action.
+	 */
+	kfree(slwt->aug_srh);
 	kfree(slwt->srh);
 }
 
@@ -1738,6 +1856,15 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
 		.optattrs	= SEG6_F_MOBILE_COUNTERS,
 		.input		= input_action_end_m_gtp6_d,
+	},
+	{
+		.action		= SEG6_MOBILE_ACTION_END_M_GTP6_D_DI,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
+		.input		= input_action_end_m_gtp6_d_di,
+		.validate	= seg6_mobile_end_m_gtp6_d_di_validate,
 	},
 };
 
