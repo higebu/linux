@@ -985,6 +985,108 @@ static int seg6_mobile_orig_input(struct sk_buff *skb)
 	return -EINVAL;
 }
 
+/* Strip the outer IPv6 / UDP / GTPv1-U envelope from @skb so the
+ * inner T-PDU lies at the network header.  Shared by End.M.GTP6.D
+ * and its drop-in variant End.M.GTP6.D.Di: the parse / pull /
+ * inner-protocol-pick logic is identical and only the subsequent
+ * SRv6 push differs between the two.
+ *
+ * On success returns 0 with @teid / @qfi filled from the GTP-U header
+ * and @inner_proto set to IPPROTO_IPIP or IPPROTO_IPV6 from the first
+ * nibble of the inner T-PDU; @skb has been advanced and its protocol
+ * / transport_header reset to the inner.
+ *
+ * Returns -EOPNOTSUPP for outers that are not GTPv1-U T-PDU (non-UDP
+ * upper layer, non-GTP1U destination port, GTP message types other
+ * than T-PDU).  The caller should pass the unchanged @skb through to
+ * the lwtunnel's saved orig_input so a downstream peer that owns the
+ * GTP-U control plane can process the packet.  Returns -EINVAL for
+ * malformed packets the caller must drop.
+ */
+static int seg6_mobile_decap_gtp6_outer(struct sk_buff *skb, u32 *teid,
+					u8 *qfi, int *inner_proto)
+{
+	enum seg6_mobile_srh_state srh_state;
+	struct ipv6_sr_hdr *srh;
+	unsigned int outer_len;
+	struct ipv6hdr *ip6h;
+	struct udphdr *uh;
+	__be16 frag_off;
+	int gtp_hdrlen;
+	u8 inner_first;
+	int upper_off;
+	u8 nh;
+
+	/* RFC 9433 Section 6.3 SRH-S02: drop if the outer SRH carries
+	 * SegmentsLeft != 0.
+	 */
+	srh = seg6_mobile_get_and_validate_srh(skb, &srh_state);
+	if (srh_state == SEG6_MOBILE_SRH_MALFORMED)
+		return -EINVAL;
+	if (srh && srh->segments_left != 0)
+		return -EINVAL;
+
+	if (!pskb_may_pull(skb, sizeof(*ip6h)))
+		return -EINVAL;
+
+	ip6h = ipv6_hdr(skb);
+	nh = ip6h->nexthdr;
+	upper_off = ipv6_skip_exthdr(skb, sizeof(*ip6h), &nh, &frag_off);
+	if (upper_off < 0)
+		return -EINVAL;
+	if (nh != IPPROTO_UDP)
+		return -EOPNOTSUPP;
+
+	if (!pskb_may_pull(skb, upper_off + sizeof(*uh)))
+		return -EINVAL;
+	ip6h = ipv6_hdr(skb);
+	uh = (struct udphdr *)((u8 *)ip6h + upper_off);
+	if (uh->dest != htons(GTP1U_PORT))
+		return -EOPNOTSUPP;
+
+	gtp_hdrlen = seg6_mobile_parse_gtpu(skb, upper_off + sizeof(*uh),
+					    teid, qfi);
+	if (gtp_hdrlen == -EOPNOTSUPP)
+		return -EOPNOTSUPP;
+	if (gtp_hdrlen < 0)
+		return -EINVAL;
+
+	outer_len = upper_off + sizeof(*uh) + gtp_hdrlen;
+
+	if (!pskb_may_pull(skb, outer_len + 1))
+		return -EINVAL;
+
+	/* RFC 9433 Section 6.3 Notes: for an IPv4v6 PDU Session Type the
+	 * inner NH is identified by the first nibble of the inner PDU.
+	 */
+	inner_first = *((u8 *)skb->data + outer_len);
+	switch (inner_first >> 4) {
+	case 4:
+		*inner_proto = IPPROTO_IPIP;
+		if (!pskb_may_pull(skb, outer_len + sizeof(struct iphdr)))
+			return -EINVAL;
+		break;
+	case 6:
+		*inner_proto = IPPROTO_IPV6;
+		if (!pskb_may_pull(skb, outer_len + sizeof(struct ipv6hdr)))
+			return -EINVAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	skb_pull_rcsum(skb, outer_len);
+	skb_reset_network_header(skb);
+	skb->protocol = *inner_proto == IPPROTO_IPIP ? htons(ETH_P_IP)
+						     : htons(ETH_P_IPV6);
+	skb_set_transport_header(skb,
+				 *inner_proto == IPPROTO_IPIP ?
+				 sizeof(struct iphdr) :
+				 sizeof(struct ipv6hdr));
+
+	return 0;
+}
+
 /* End.M.GTP6.D: receive an IPv6/UDP/GTPv1-U packet matching a locally
  * instantiated End.M.GTP6.D SID and re-encapsulate the inner T-PDU in
  * SRv6 using the configured SR Policy.  TEID and QFI are folded into
@@ -1000,89 +1102,18 @@ static int seg6_mobile_orig_input(struct sk_buff *skb)
 static int input_action_end_m_gtp6_d(struct sk_buff *skb,
 				     struct seg6_mobile_lwt *slwt)
 {
-	enum seg6_mobile_srh_state srh_state;
 	struct ipv6_sr_hdr *new_srh;
-	struct ipv6_sr_hdr *srh;
-	unsigned int outer_len;
-	struct ipv6hdr *ip6h;
-	struct udphdr *uh;
 	int inner_proto;
-	int gtp_hdrlen;
-	int upper_off;
-	__be16 frag_off;
-	u8 inner_first;
 	u64 args_mob;
 	u32 teid;
+	int err;
 	u8 qfi;
-	u8 nh;
 
-	/* RFC 9433 Section 6.3 SRH-S02: drop if the outer SRH carries
-	 * SegmentsLeft != 0.
-	 */
-	srh = seg6_mobile_get_and_validate_srh(skb, &srh_state);
-	if (srh_state == SEG6_MOBILE_SRH_MALFORMED)
-		goto drop;
-	if (srh && srh->segments_left != 0)
-		goto drop;
-
-	if (!pskb_may_pull(skb, sizeof(*ip6h)))
-		goto drop;
-
-	ip6h = ipv6_hdr(skb);
-	nh = ip6h->nexthdr;
-	upper_off = ipv6_skip_exthdr(skb, sizeof(*ip6h), &nh, &frag_off);
-	if (upper_off < 0)
-		goto drop;
-	if (nh != IPPROTO_UDP)
+	err = seg6_mobile_decap_gtp6_outer(skb, &teid, &qfi, &inner_proto);
+	if (err == -EOPNOTSUPP)
 		return seg6_mobile_orig_input(skb);
-
-	if (!pskb_may_pull(skb, upper_off + sizeof(*uh)))
+	if (err)
 		goto drop;
-	ip6h = ipv6_hdr(skb);
-	uh = (struct udphdr *)((u8 *)ip6h + upper_off);
-	if (uh->dest != htons(GTP1U_PORT))
-		return seg6_mobile_orig_input(skb);
-
-	gtp_hdrlen = seg6_mobile_parse_gtpu(skb, upper_off + sizeof(*uh),
-					    &teid, &qfi);
-	if (gtp_hdrlen == -EOPNOTSUPP)
-		return seg6_mobile_orig_input(skb);
-	if (gtp_hdrlen < 0)
-		goto drop;
-
-	outer_len = upper_off + sizeof(*uh) + gtp_hdrlen;
-	args_mob = seg6_mobile_args_from_teid_qfi(teid, qfi);
-
-	if (!pskb_may_pull(skb, outer_len + 1))
-		goto drop;
-
-	/* RFC 9433 Section 6.3 Notes: for an IPv4v6 PDU Session Type the
-	 * inner NH is identified by the first nibble of the inner PDU.
-	 */
-	inner_first = *((u8 *)skb->data + outer_len);
-	switch (inner_first >> 4) {
-	case 4:
-		inner_proto = IPPROTO_IPIP;
-		if (!pskb_may_pull(skb, outer_len + sizeof(struct iphdr)))
-			goto drop;
-		break;
-	case 6:
-		inner_proto = IPPROTO_IPV6;
-		if (!pskb_may_pull(skb, outer_len + sizeof(struct ipv6hdr)))
-			goto drop;
-		break;
-	default:
-		goto drop;
-	}
-
-	skb_pull_rcsum(skb, outer_len);
-	skb_reset_network_header(skb);
-	skb->protocol = inner_proto == IPPROTO_IPIP ? htons(ETH_P_IP)
-						    : htons(ETH_P_IPV6);
-	skb_set_transport_header(skb,
-				 inner_proto == IPPROTO_IPIP ?
-				 sizeof(struct iphdr) :
-				 sizeof(struct ipv6hdr));
 
 	/* RFC 9433 Section 6.3 S04-S07: push a new IPv6 + SRH containing
 	 * the configured SR Policy.  seg6_do_srh_encap propagates TC /
@@ -1102,6 +1133,7 @@ static int input_action_end_m_gtp6_d(struct sk_buff *skb,
 	 * outer DA, so refresh it; for multi-segment policies the outer
 	 * DA references a different segment and remains valid.
 	 */
+	args_mob = seg6_mobile_args_from_teid_qfi(teid, qfi);
 	seg6_mobile_write_args_mob(&new_srh->segments[0], slwt->sr_prefix_len,
 				   args_mob);
 	ipv6_hdr(skb)->daddr = new_srh->segments[new_srh->first_segment];
