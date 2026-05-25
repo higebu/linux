@@ -89,6 +89,10 @@ struct seg6_mobile_counters {
 struct seg6_mobile_lwt {
 	int action;
 	struct ipv6_sr_hdr *srh;
+	/* augmented SR Policy SRH used by End.M.GTP6.D.Di; its extra
+	 * leading slot is stamped per-packet with the original outer DA.
+	 */
+	struct ipv6_sr_hdr *aug_srh;
 	struct in6_addr nh6;
 	struct in6_addr src_addr;
 	u8 v4_mask_len;
@@ -1090,6 +1094,99 @@ drop:
 	return -EINVAL;
 }
 
+/* allocate the augmented SR Policy SRH used by End.M.GTP6.D.Di; the
+ * leading slot is stamped per-packet with the original outer DA.
+ */
+static int seg6_mobile_end_m_gtp6_d_di_validate(struct seg6_mobile_lwt *slwt,
+						struct netlink_ext_ack *extack)
+{
+	struct ipv6_sr_hdr *aug;
+	int orig_len, aug_len;
+
+	/* hdrlen is u8 and counts the SRH length in 8-byte units minus
+	 * one.  The augmented SRH adds one 16-byte segment, so reject
+	 * inputs whose +2-unit hdrlen would not fit.
+	 */
+	if (slwt->srh->hdrlen > 253) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile SRH too large for End.M.GTP6.D.Di (max 126 segments)");
+		return -EINVAL;
+	}
+
+	orig_len = (slwt->srh->hdrlen + 1) << 3;
+	aug_len = orig_len + sizeof(struct in6_addr);
+
+	aug = kzalloc(aug_len, GFP_KERNEL);
+	if (!aug)
+		return -ENOMEM;
+
+	memcpy(aug, slwt->srh, sizeof(*aug));
+	aug->hdrlen = (aug_len >> 3) - 1;
+	aug->segments_left = slwt->srh->segments_left + 1;
+	aug->first_segment = slwt->srh->first_segment + 1;
+	/* segments[0] is left zero; the data path overwrites it with
+	 * the original outer destination once seg6_do_srh_encap() has
+	 * copied the SRH into the skb.
+	 */
+	memcpy(&aug->segments[1], &slwt->srh->segments[0],
+	       orig_len - sizeof(*aug));
+
+	slwt->aug_srh = aug;
+	return 0;
+}
+
+/* drop-in variant of End.M.GTP6.D: re-encap using the SR Policy
+ * augmented with a leading slot stamped with the original outer DA,
+ * leaving Args.Mob.Session untouched so existing SR paths keep their
+ * per-session identifiers.
+ */
+static int input_action_end_m_gtp6_d_di(struct sk_buff *skb,
+					struct seg6_mobile_lwt *slwt)
+{
+	struct ipv6_sr_hdr *new_srh;
+	struct in6_addr orig_dst;
+	int inner_proto;
+	u32 teid;
+	int err;
+	u8 qfi;
+
+	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
+		goto drop;
+	orig_dst = ipv6_hdr(skb)->daddr;
+
+	err = seg6_mobile_decap_gtp6_outer(skb, &teid, &qfi, &inner_proto);
+	if (err == -EOPNOTSUPP)
+		return seg6_mobile_orig_input(skb);
+	if (err)
+		goto drop;
+
+	/* TEID/QFI are discarded; the SR domain sees no per-session
+	 * marking from this hop.
+	 */
+	(void)teid;
+	(void)qfi;
+
+	if (seg6_do_srh_encap(skb, slwt->aug_srh, inner_proto))
+		goto drop;
+
+	skb->protocol = htons(ETH_P_IPV6);
+
+	new_srh = (struct ipv6_sr_hdr *)(skb_network_header(skb) +
+					 sizeof(struct ipv6hdr));
+	/* preserve the original outer destination in the prepended slot
+	 * so the SR domain still delivers to the pre-drop-in endpoint.
+	 */
+	new_srh->segments[0] = orig_dst;
+	ipv6_hdr(skb)->saddr = slwt->src_addr;
+
+	nf_reset_ct(skb);
+	return seg6_mobile_forward(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* Cross-attribute sanity check for actions that synthesise an IPv4
  * source from the IPv6 source: the Source UPF Prefix length P (= the
  * configured v6_src_prefix_len, or
@@ -1298,6 +1395,11 @@ static int cmp_nla_srh(struct seg6_mobile_lwt *a, struct seg6_mobile_lwt *b)
 
 static void destroy_attr_srh(struct seg6_mobile_lwt *slwt)
 {
+	/* aug_srh is paired with srh: it is built from srh by the
+	 * End.M.GTP6.D.Di validate hook and is NULL for every other
+	 * action.
+	 */
+	kfree(slwt->aug_srh);
 	kfree(slwt->srh);
 }
 
@@ -1468,6 +1570,14 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
 		.optattrs	= SEG6_F_MOBILE_COUNTERS,
 		.input		= input_action_end_m_gtp6_d,
+	},
+	{
+		.action		= SEG6_MOBILE_ACTION_END_M_GTP6_D_DI,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS,
+		.input		= input_action_end_m_gtp6_d_di,
+		.validate	= seg6_mobile_end_m_gtp6_d_di_validate,
 	},
 };
 
