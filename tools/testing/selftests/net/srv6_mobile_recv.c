@@ -61,6 +61,7 @@ enum mode {
 	MODE_GTP6_E,
 	MODE_GTP6_D,
 	MODE_GTP6_PASSTHRU,
+	MODE_RA6,
 };
 
 struct cfg {
@@ -91,6 +92,8 @@ static void usage(const char *bin)
 "  gtp6-e         End.M.GTP6.E (IPv6/UDP/GTPv1-U[/PDU Session]/inner)\n"
 "  gtp6-d         End.M.GTP6.D (IPv6/SRH/inner with stamped Args.Mob.Session)\n"
 "  gtp6-passthru  match an unmodified IPv6/UDP/GTPv1-U arrival\n"
+"  ra6            hold an IPv6 Router Alert socket, and report whether\n"
+"                 a packet from <src> reached it\n"
 "\n"
 "Common options:\n"
 "  -i <iface>          interface to bind AF_PACKET to\n"
@@ -147,12 +150,15 @@ static enum mode parse_mode(const char *s)
 		return MODE_GTP6_D;
 	if (!strcmp(s, "gtp6-passthru"))
 		return MODE_GTP6_PASSTHRU;
+	if (!strcmp(s, "ra6"))
+		return MODE_RA6;
 	return MODE_NONE;
 }
 
 static bool mode_is_v6_outer(enum mode m)
 {
-	return m == MODE_GTP6_E || m == MODE_GTP6_D || m == MODE_GTP6_PASSTHRU;
+	return m == MODE_GTP6_E || m == MODE_GTP6_D ||
+	       m == MODE_GTP6_PASSTHRU || m == MODE_RA6;
 }
 
 static int parse_args(int argc, char **argv, struct cfg *cfg)
@@ -404,6 +410,57 @@ static int elapsed_ms(const struct timespec *t0)
 	       (now.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
+/* exit 0 if the Router Alert socket gets a packet from the source, 2 if
+ * not; MLD messages, which carry Router Alert too, come from elsewhere
+ */
+static int ra6_listen(const struct cfg *cfg)
+{
+	struct pollfd pfd = { .events = POLLIN };
+	struct sockaddr_in6 from;
+	int value = 0, remaining;
+	struct timespec t0;
+	socklen_t len;
+	uint8_t buf[2048];
+
+	/* only an IPPROTO_RAW socket takes Router Alert packets */
+	pfd.fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+	if (pfd.fd < 0) {
+		perror("socket");
+		return 3;
+	}
+	if (setsockopt(pfd.fd, IPPROTO_IPV6, IPV6_ROUTER_ALERT, &value,
+		       sizeof(value))) {
+		perror("IPV6_ROUTER_ALERT");
+		close(pfd.fd);
+		return 3;
+	}
+	if (cfg->ready_path) {
+		FILE *fp = fopen(cfg->ready_path, "w");
+
+		if (!fp || fputs("ready\n", fp) == EOF || fclose(fp)) {
+			perror("ready file");
+			close(pfd.fd);
+			return 3;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		remaining = cfg->timeout_ms - elapsed_ms(&t0);
+		if (remaining <= 0 || poll(&pfd, 1, remaining) <= 0)
+			break;
+		len = sizeof(from);
+		if (recvfrom(pfd.fd, buf, sizeof(buf), MSG_DONTWAIT,
+			     (struct sockaddr *)&from, &len) < 0)
+			continue;
+		if (!memcmp(&from.sin6_addr, &cfg->src6, sizeof(cfg->src6))) {
+			close(pfd.fd);
+			return 0;
+		}
+	}
+	close(pfd.fd);
+	return 2;
+}
+
 int main(int argc, char **argv)
 {
 	struct timespec t0;
@@ -417,6 +474,8 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return 3;
 	}
+	if (cfg.mode == MODE_RA6)
+		return ra6_listen(&cfg);
 
 	fd = socket(AF_PACKET, SOCK_DGRAM,
 		    htons(mode_is_v6_outer(cfg.mode) ? ETH_P_IPV6 : ETH_P_IP));

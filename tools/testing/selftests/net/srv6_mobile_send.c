@@ -11,6 +11,8 @@
  *                    [--l4 icmp|udp|tcp] [--l4-len N]
  *   srv6_mobile_send -m gtp6-d  -s <src> -d <dst> [-t TEID] [-q QFI]
  *                              [-P PDU_TYPE] [--echo] [--malformed]
+ *   srv6_mobile_send -m gtp4-d  -s <src4> -d <dst4> [-t TEID] [-q QFI]
+ *                              [-P PDU_TYPE] [--echo] [--malformed]
  */
 
 #include <arpa/inet.h>
@@ -18,6 +20,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <netinet/ip_icmp.h>
@@ -59,6 +62,7 @@ static_assert(sizeof(struct rh_fixed) == 8, "rh_fixed must be 8 bytes");
  * one-segment type 0 Routing Header, a two-segment SRH and a TCP header
  */
 #define HBH_LEN		8
+#define PAD_MAX		1400
 #define END_MAP_PKT_MAX	(sizeof(struct ip6_hdr) + HBH_LEN + \
 			 2 * sizeof(struct rh_fixed) + \
 			 3 * sizeof(struct in6_addr) + sizeof(struct tcphdr))
@@ -88,6 +92,7 @@ enum mode {
 	MODE_NONE,
 	MODE_END_MAP,
 	MODE_GTP6_D,
+	MODE_GTP4_D,
 };
 
 struct cfg {
@@ -95,6 +100,8 @@ struct cfg {
 	struct in6_addr	src6;
 	struct in6_addr	dst6;
 	struct in6_addr	segment;
+	struct in_addr	src4;
+	struct in_addr	dst4;
 	uint32_t	teid;
 	uint8_t		qfi;
 	uint8_t		pdu_type;
@@ -122,6 +129,10 @@ struct cfg {
 	uint8_t		tclass;
 	uint8_t		inner_hlim;
 	uint8_t		ext_len;
+	bool		udp_csum;
+	bool		rr;
+	uint16_t	frag_off;
+	uint16_t	pad;
 };
 
 static void usage(const char *bin)
@@ -132,6 +143,7 @@ static void usage(const char *bin)
 		"Modes:\n"
 		"  end-map    Send IPv6 + SRH + ICMPv6 echo for End.MAP testing\n"
 		"  gtp6-d     Send IPv6 + UDP + GTPv1-U[+PDU Session] for End.M.GTP6.D testing\n"
+		"  gtp4-d     Send IPv4 + UDP + GTPv1-U[+PDU Session] for H.M.GTP4.D testing\n"
 		"\n"
 		"Mode end-map options:\n"
 		"  --rh-type <n>       Routing Header type (default 4, the SRH)\n"
@@ -145,7 +157,7 @@ static void usage(const char *bin)
 		"  --l4-len <n>        truncate the L4 header to n bytes\n"
 		"  --hbh-ra            prepend a Hop-by-Hop Router Alert option\n"
 		"\n"
-		"Mode gtp6-d options:\n"
+		"Mode gtp6-d / gtp4-d options:\n"
 		"  -t <teid>           GTP-U TEID (decimal or 0xHEX), default 0x123\n"
 		"  -q <qfi>            QFI (requires --pdu-session)\n"
 		"  -P <pdu-type>       PDU Type (requires --pdu-session)\n"
@@ -153,12 +165,17 @@ static void usage(const char *bin)
 		"  --echo              emit a GTPv1-U Echo Request instead of T-PDU\n"
 		"  --malformed         emit an extension chain with ext_units=0 (drop test)\n"
 		"  --dup-pdu-session   emit two PDU Session extension headers (drop test)\n"
-		"  --frag              insert an IPv6 Fragment header (gtp6-d, drop test)\n"
+		"  --frag              insert an IPv6 Fragment header (gtp6-d), or set\n"
+		"                      More Fragments (gtp4-d) (drop test)\n"
+		"  --frag-off <n>      IPv4 Fragment Offset in 8-byte units (gtp4-d)\n"
+		"  --rr                add an IPv4 Record Route option (gtp4-d)\n"
+		"  --udp-csum          send a UDP checksum (gtp4-d)\n"
+		"  --pad <n>           append n zero bytes to the T-PDU (n <= 1400)\n"
 		"  --bad-csum          send a wrong UDP checksum\n"
 		"  --zero-csum         send a zero UDP checksum\n"
 		"  --gtp-len <n>       GTP-U Length (default: what follows the header)\n"
 		"  --ext-len <n>       PDU Session container length in 4-byte units (1..8)\n"
-		"  --tclass <n>        outer Traffic Class\n"
+		"  --tclass <n>        outer Traffic Class or TOS\n"
 		"  --inner-hlim <n>    T-PDU Hop Limit or TTL (default 64)\n"
 		"  --inner4            send an IPv4 T-PDU\n"
 		"  --active-srh        insert an SRH with Segments Left 1 (gtp6-d)\n"
@@ -209,7 +226,14 @@ static enum mode parse_mode(const char *s)
 		return MODE_END_MAP;
 	if (!strcmp(s, "gtp6-d"))
 		return MODE_GTP6_D;
+	if (!strcmp(s, "gtp4-d"))
+		return MODE_GTP4_D;
 	return MODE_NONE;
+}
+
+static bool mode_is_v4_outer(enum mode m)
+{
+	return m == MODE_GTP4_D;
 }
 
 static int parse_args(int argc, char **argv, struct cfg *cfg)
@@ -242,6 +266,10 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 		{ "inner-hlim",      required_argument, NULL, 'l' },
 		{ "inner4",          no_argument, NULL, '4' },
 		{ "active-srh",      no_argument, NULL, 'a' },
+		{ "udp-csum",        no_argument, NULL, 'u' },
+		{ "rr",              no_argument, NULL, 'R' },
+		{ "frag-off",        required_argument, NULL, 'o' },
+		{ "pad",             required_argument, NULL, 'p' },
 		{ NULL, 0, NULL, 0 },
 	};
 	uint32_t v;
@@ -258,12 +286,22 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			cfg->mode = parse_mode(optarg);
 			break;
 		case 's':
-			if (inet_pton(AF_INET6, optarg, &cfg->src6) != 1)
-				return -1;
+			if (mode_is_v4_outer(cfg->mode)) {
+				if (inet_pton(AF_INET, optarg, &cfg->src4) != 1)
+					return -1;
+			} else {
+				if (inet_pton(AF_INET6, optarg, &cfg->src6) != 1)
+					return -1;
+			}
 			break;
 		case 'd':
-			if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
-				return -1;
+			if (mode_is_v4_outer(cfg->mode)) {
+				if (inet_pton(AF_INET, optarg, &cfg->dst4) != 1)
+					return -1;
+			} else {
+				if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
+					return -1;
+			}
 			break;
 		case 't':
 			if (parse_u32(optarg, &cfg->teid))
@@ -359,6 +397,22 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			break;
 		case 'a':
 			cfg->active_srh = true;
+			break;
+		case 'u':
+			cfg->udp_csum = true;
+			break;
+		case 'R':
+			cfg->rr = true;
+			break;
+		case 'o':
+			if (parse_u32(optarg, &v) || !v || v > 0x1fff)
+				return -1;
+			cfg->frag_off = v;
+			break;
+		case 'p':
+			if (parse_u32(optarg, &v) || v > PAD_MAX)
+				return -1;
+			cfg->pad = v;
 			break;
 		default:
 			return -1;
@@ -560,10 +614,12 @@ send:
 #define INNER_PAYLOAD_LEN	16
 #define GPDU_MAX		(sizeof(struct gtp1_hdr_long) + 8 * 4 + \
 				 sizeof(struct pdu_session_ext) + \
-				 sizeof(struct ip6_hdr) + INNER_PAYLOAD_LEN)
+				 sizeof(struct ip6_hdr) + INNER_PAYLOAD_LEN + \
+				 PAD_MAX)
 
 /* write the T-PDU, an ICMPv6 echo, or an ICMP echo with --inner4, at
- * @buf and return its length
+ * @buf and return its length; the --pad zero bytes add nothing to the
+ * checksums but the length
  */
 static size_t put_tpdu(uint8_t *buf, const struct cfg *cfg)
 {
@@ -577,7 +633,7 @@ static size_t put_tpdu(uint8_t *buf, const struct cfg *cfg)
 		iph = (struct iphdr *)buf;
 		iph->version = 4;
 		iph->ihl = sizeof(*iph) >> 2;
-		iph->tot_len = htons(sizeof(*iph) + sizeof(icmp));
+		iph->tot_len = htons(sizeof(*iph) + sizeof(icmp) + cfg->pad);
 		iph->ttl = hlim;
 		iph->protocol = IPPROTO_ICMP;
 		iph->saddr = htonl(0x0a640001);	/* 10.100.0.1 */
@@ -588,12 +644,12 @@ static size_t put_tpdu(uint8_t *buf, const struct cfg *cfg)
 		icmp.un.echo.sequence = htons(1);
 		icmp.checksum = csum_fold(csum_partial(&icmp, sizeof(icmp), 0));
 		memcpy(iph + 1, &icmp, sizeof(icmp));
-		return sizeof(*iph) + sizeof(icmp);
+		return sizeof(*iph) + sizeof(icmp) + cfg->pad;
 	}
 
 	ip6 = (struct ip6_hdr *)buf;
 	ip6->ip6_flow = htonl(6u << 28);
-	ip6->ip6_plen = htons(sizeof(icmp6));
+	ip6->ip6_plen = htons(sizeof(icmp6) + cfg->pad);
 	ip6->ip6_nxt = IPPROTO_ICMPV6;
 	ip6->ip6_hops = hlim;
 	inet_pton(AF_INET6, "2001:db8:100::1", &ip6->ip6_src);
@@ -602,10 +658,10 @@ static size_t put_tpdu(uint8_t *buf, const struct cfg *cfg)
 	icmp6.icmp6_dataun.icmp6_un_data16[0] = htons(0xdead);
 	icmp6.icmp6_dataun.icmp6_un_data16[1] = htons(1);
 	icmp6.icmp6_cksum = pseudo_csum(&ip6->ip6_src, &ip6->ip6_dst,
-					sizeof(icmp6), IPPROTO_ICMPV6,
-					&icmp6, sizeof(icmp6));
+					sizeof(icmp6) + cfg->pad,
+					IPPROTO_ICMPV6, &icmp6, sizeof(icmp6));
 	memcpy(ip6 + 1, &icmp6, sizeof(icmp6));
-	return sizeof(*ip6) + sizeof(icmp6);
+	return sizeof(*ip6) + sizeof(icmp6) + cfg->pad;
 }
 
 /* write the GTP-U header and, unless --echo, the T-PDU at @buf and return
@@ -739,6 +795,89 @@ static int send_gtp6_d(const struct cfg *cfg)
 	return 0;
 }
 
+static int send_gtp4_d(const struct cfg *cfg)
+{
+	uint8_t frame[sizeof(struct iphdr) + 8 + sizeof(struct udphdr) +
+		      GPDU_MAX];
+	struct sockaddr_in dst_addr = { .sin_family = AF_INET };
+	size_t frame_len, ihl, udp_len;
+	struct iphdr *outer;
+	struct udphdr *uh;
+	uint32_t sum;
+	ssize_t res;
+	int fd, one = 1;
+
+	memset(frame, 0, sizeof(frame));
+	outer = (struct iphdr *)frame;
+	ihl = sizeof(*outer);
+	if (cfg->rr) {
+		/* Record Route with one empty slot, then End of Options */
+		frame[ihl] = IPOPT_RR;
+		frame[ihl + 1] = 7;
+		frame[ihl + 2] = 4;
+		ihl += 8;
+	}
+
+	uh = (struct udphdr *)(frame + ihl);
+	frame_len = ihl + sizeof(*uh) + put_gpdu((uint8_t *)(uh + 1), cfg);
+	udp_len = frame_len - ihl;
+
+	outer->version = 4;
+	outer->ihl = ihl >> 2;
+	outer->tos = cfg->tclass;
+	outer->tot_len = htons(frame_len);
+	outer->id = 0;
+	if (cfg->frag)
+		outer->frag_off = htons(IP_MF);
+	else if (cfg->frag_off)
+		outer->frag_off = htons(cfg->frag_off);
+	else
+		outer->frag_off = htons(IP_DF);
+	outer->ttl = 64;
+	outer->protocol = IPPROTO_UDP;
+	outer->saddr = cfg->src4.s_addr;
+	outer->daddr = cfg->dst4.s_addr;
+	outer->check = 0;
+	outer->check = csum_fold(csum_partial(outer, ihl, 0));
+
+	uh->source = htons(GTP1U_PORT);
+	uh->dest = htons(GTP1U_PORT);
+	uh->len = htons(udp_len);
+	/* optional for IPv4 outer, and zero unless asked for */
+	uh->check = 0;
+	if (cfg->udp_csum || cfg->bad_csum) {
+		sum = csum_partial(&outer->saddr, 2 * sizeof(outer->saddr), 0);
+		sum += htons(IPPROTO_UDP);
+		sum += htons(udp_len);
+		set_udp_csum(uh, csum_fold(csum_partial(uh, udp_len, sum)),
+			     cfg);
+	}
+
+	fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+	if (fd < 0) {
+		perror("socket");
+		return 1;
+	}
+	/* IPPROTO_RAW already implies IP_HDRINCL on Linux, but set it
+	 * explicitly so the kernel does not regenerate the IP header.
+	 */
+	if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one))) {
+		perror("IP_HDRINCL");
+		close(fd);
+		return 1;
+	}
+	dst_addr.sin_addr.s_addr = outer->daddr;
+
+	res = sendto(fd, frame, frame_len, 0,
+		     (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+	close(fd);
+	if (res != (ssize_t)frame_len) {
+		perror("sendto");
+		return 1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct cfg cfg = {};
@@ -753,6 +892,8 @@ int main(int argc, char **argv)
 		return send_end_map(&cfg);
 	case MODE_GTP6_D:
 		return send_gtp6_d(&cfg);
+	case MODE_GTP4_D:
+		return send_gtp4_d(&cfg);
 	default:
 		usage(argv[0]);
 		return 3;
