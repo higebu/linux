@@ -38,6 +38,11 @@ struct seg6_mobile_lwt;
 
 struct seg6_mobile_action_desc {
 	int action;
+	/* Address family of the FIB hook the route is installed on.
+	 * Defaults to AF_INET6 when 0; entries that run on IPv4 routes
+	 * (currently only H.M.GTP4.D) set this to AF_INET explicitly.
+	 */
+	int input_family;
 	unsigned long attrs;
 	unsigned long optattrs;
 	int (*input)(struct sk_buff *skb, struct seg6_mobile_lwt *slwt);
@@ -1173,6 +1178,176 @@ drop:
 	return -EINVAL;
 }
 
+/* Overlay the 32-bit IPv4 source @v4 into the IPv6 source template
+ * @addr right after a @v6_src_prefix_len-bit prefix (default /64).
+ */
+static void seg6_mobile_overlay_v4(struct in6_addr *addr, u8 v4_mask_len,
+				   u8 v6_src_prefix_len, __be32 v4)
+{
+	u8 p_bits = v6_src_prefix_len ? : SEG6_MOBILE_V6_SRC_PREFIX_LEN_DEFAULT;
+	u8 sa_bits = min_t(u8, v4_mask_len, 32);
+	u64 v4_left;
+
+	if (!sa_bits || (unsigned int)p_bits + sa_bits > 128)
+		return;
+
+	v4_left = (u64)ntohl(v4) << 32;
+	seg6_mobile_addr_set_bits(addr->s6_addr, p_bits, sa_bits, v4_left);
+}
+
+/* Encode the IPv4 DA and Args.Mob.Session into @sid right after a
+ * @prefix_bits-bit locator.
+ */
+static int seg6_mobile_fill_egress_sid(struct in6_addr *sid,
+				       unsigned int prefix_bits,
+				       u8 v4_mask_len, __be32 v4, u64 args)
+{
+	u8 sa_bits = min_t(u8, v4_mask_len, 32);
+	u64 v4_left;
+
+	if (prefix_bits + sa_bits + SEG6_MOBILE_ARGS_MOB_LEN > 128)
+		return -EINVAL;
+
+	if (sa_bits) {
+		v4_left = (u64)ntohl(v4) << 32;
+		seg6_mobile_addr_set_bits(sid->s6_addr, prefix_bits, sa_bits,
+					  v4_left);
+	}
+
+	seg6_mobile_addr_set_bits(sid->s6_addr, prefix_bits + sa_bits,
+				  SEG6_MOBILE_ARGS_MOB_LEN, args);
+	return 0;
+}
+
+/* strip the inbound IPv4/UDP/GTP-U envelope and re-encap as SRv6 */
+static int input_action_h_m_gtp4_d(struct sk_buff *skb,
+				   struct seg6_mobile_lwt *slwt)
+{
+	unsigned int outer_len, inner_off, srh_len, post_encap, mtu;
+	struct in6_addr new_da, new_sa;
+	u8 inner_first, outer_tclass;
+	struct ipv6_sr_hdr *new_srh;
+	int inner_proto, gtp_hdrlen;
+	__be32 v4_da, v4_sa;
+	struct iphdr *ip4h;
+	struct udphdr *uh;
+	u64 args_mob;
+	u32 teid;
+	int ihl;
+	u8 qfi;
+
+	if (!pskb_may_pull(skb, sizeof(*ip4h)))
+		goto drop;
+
+	ip4h = ip_hdr(skb);
+	if (ip4h->protocol != IPPROTO_UDP || ip4h->ihl < 5)
+		goto drop;
+
+	ihl = ip4h->ihl * 4;
+	if (!pskb_may_pull(skb, ihl + sizeof(*uh)))
+		goto drop;
+
+	ip4h = ip_hdr(skb);
+	uh = (struct udphdr *)((u8 *)ip4h + ihl);
+	if (uh->dest != htons(GTP1U_PORT))
+		goto drop;
+
+	/* Snapshot the outer IPv4 fields before seg6_mobile_parse_gtpu(),
+	 * whose pskb_may_pull() calls may invalidate @ip4h.
+	 */
+	v4_da = ip4h->daddr;
+	v4_sa = ip4h->saddr;
+	outer_tclass = ipv4_get_dsfield(ip4h);
+
+	gtp_hdrlen = seg6_mobile_parse_gtpu(skb, ihl + sizeof(*uh), &teid, &qfi);
+	if (gtp_hdrlen == -EOPNOTSUPP)
+		return seg6_mobile_orig_input(skb);
+	if (gtp_hdrlen < 0)
+		goto drop;
+
+	args_mob = seg6_mobile_args_from_teid_qfi(teid, qfi);
+
+	new_da = slwt->srh->segments[0];
+	if (seg6_mobile_fill_egress_sid(&new_da, slwt->sr_prefix_len,
+					slwt->v4_mask_len, v4_da, args_mob))
+		goto drop;
+
+	new_sa = slwt->src_addr;
+	seg6_mobile_overlay_v4(&new_sa, slwt->v4_mask_len,
+			       slwt->v6_src_prefix_len, v4_sa);
+
+	outer_len = ihl + sizeof(*uh) + gtp_hdrlen;
+	if (!pskb_may_pull(skb, outer_len + 1))
+		goto drop;
+
+	inner_off = outer_len;
+	inner_first = *((u8 *)skb->data + inner_off);
+	switch (inner_first >> 4) {
+	case 4:
+		inner_proto = IPPROTO_IPIP;
+		if (!pskb_may_pull(skb, outer_len + sizeof(struct iphdr)))
+			goto drop;
+		break;
+	case 6:
+		inner_proto = IPPROTO_IPV6;
+		if (!pskb_may_pull(skb, outer_len + sizeof(struct ipv6hdr)))
+			goto drop;
+		break;
+	default:
+		goto drop;
+	}
+
+	/* Reject packets that would not fit the post-encap MTU.  IPv6
+	 * does not fragment in transit, and the GSO segmenter cannot fix
+	 * this up after the network protocol changes from IPv4 to IPv6.
+	 */
+	srh_len = (slwt->srh->hdrlen + 1) << 3;
+	post_encap = skb->len - outer_len + sizeof(struct ipv6hdr) + srh_len;
+	mtu = dst_mtu(skb_dst(skb));
+	if (mtu && post_encap > mtu)
+		goto drop;
+	if (skb_is_gso(skb)) {
+		int upstream_mtu = (int)mtu + (int)outer_len -
+				   (int)(sizeof(struct ipv6hdr) + srh_len);
+
+		if (mtu && (upstream_mtu <= 0 ||
+			    !skb_gso_validate_network_len(skb, upstream_mtu)))
+			goto drop;
+	}
+
+	skb_pull_rcsum(skb, outer_len);
+	skb_reset_network_header(skb);
+	skb->protocol = inner_proto == IPPROTO_IPIP ? htons(ETH_P_IP)
+						    : htons(ETH_P_IPV6);
+	skb_set_transport_header(skb,
+				 inner_proto == IPPROTO_IPIP ?
+				 sizeof(struct iphdr) :
+				 sizeof(struct ipv6hdr));
+
+	if (seg6_do_srh_encap(skb, slwt->srh, inner_proto))
+		goto drop;
+
+	skb->protocol = htons(ETH_P_IPV6);
+
+	new_srh = (struct ipv6_sr_hdr *)(skb_network_header(skb) +
+					 sizeof(struct ipv6hdr));
+	new_srh->segments[0] = new_da;
+	ipv6_hdr(skb)->daddr = new_srh->segments[new_srh->first_segment];
+	ipv6_hdr(skb)->saddr = new_sa;
+
+	/* Propagate the inbound IPv4 DSCP+ECN into the new outer IPv6
+	 * Traffic Class; seg6_do_srh_encap() zeroes it for IPv4 inners.
+	 */
+	ipv6_change_dsfield(ipv6_hdr(skb), 0, outer_tclass);
+
+	nf_reset_ct(skb);
+	return seg6_mobile_forward(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* Cross-attribute sanity check for actions that synthesise an IPv4
  * source from the IPv6 source: the Source UPF Prefix length P (= the
  * configured v6_src_prefix_len, or
@@ -1188,6 +1363,29 @@ static int seg6_mobile_v4_validate(struct seg6_mobile_lwt *slwt,
 	if ((unsigned int)p_bits + 32 > 128) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "SRv6 Mobile v6_src_prefix_len must leave room for the 32-bit IPv4 source template (prefix_len <= 96)");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* Cross-attribute sanity check for H.M.GTP4.D: the locator
+ * (sr_prefix_len), IPv4 DA (v4_mask_len), and 40-bit Args.Mob.Session
+ * together fill the End.M.GTP4.E SID built at egress time and must
+ * fit in 128 bits.
+ */
+static int seg6_mobile_h_m_gtp4_d_validate(struct seg6_mobile_lwt *slwt,
+					   struct netlink_ext_ack *extack)
+{
+	int err;
+
+	err = seg6_mobile_v4_validate(slwt, extack);
+	if (err)
+		return err;
+
+	if ((unsigned int)slwt->sr_prefix_len + slwt->v4_mask_len +
+	    SEG6_MOBILE_ARGS_MOB_LEN > 128) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile sr_prefix_len + v4_mask_len + 40 (Args.Mob.Session) must not exceed 128");
 		return -EINVAL;
 	}
 	return 0;
@@ -1565,6 +1763,18 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 		.input		= input_action_end_m_gtp6_d_di,
 		.validate	= seg6_mobile_end_m_gtp6_d_di_validate,
 	},
+	{
+		.action		= SEG6_MOBILE_ACTION_H_M_GTP4_D,
+		.input_family	= AF_INET,
+		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V4_MASK_LEN) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V6_SRC_PREFIX_LEN),
+		.input		= input_action_h_m_gtp4_d,
+		.validate	= seg6_mobile_h_m_gtp4_d_validate,
+	},
 };
 
 static const struct seg6_mobile_action_param
@@ -1739,14 +1949,28 @@ static int seg6_mobile_input(struct sk_buff *skb)
 	struct dst_entry *orig_dst = skb_dst(skb);
 	struct seg6_mobile_lwt *slwt;
 	unsigned int len = skb->len;
+	int desc_family;
+	bool family_ok;
 	int rc;
 
-	if (skb->protocol != htons(ETH_P_IPV6)) {
+	slwt = seg6_mobile_lwtunnel(orig_dst->lwtstate);
+	desc_family = slwt->desc->input_family ? : AF_INET6;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IPV6):
+		family_ok = desc_family == AF_INET6;
+		break;
+	case htons(ETH_P_IP):
+		family_ok = desc_family == AF_INET;
+		break;
+	default:
+		family_ok = false;
+		break;
+	}
+	if (!family_ok) {
 		kfree_skb(skb);
 		return -EINVAL;
 	}
-
-	slwt = seg6_mobile_lwtunnel(orig_dst->lwtstate);
 
 	rc = slwt->desc->input(skb, slwt);
 
@@ -1767,7 +1991,7 @@ static int seg6_mobile_build_state(struct net *net, struct nlattr *nla,
 	struct seg6_mobile_lwt *slwt;
 	int err;
 
-	if (family != AF_INET6)
+	if (family != AF_INET6 && family != AF_INET)
 		return -EINVAL;
 
 	err = nla_parse_nested_deprecated(tb, SEG6_MOBILE_MAX, nla,
@@ -1784,6 +2008,12 @@ static int seg6_mobile_build_state(struct net *net, struct nlattr *nla,
 	if (!desc) {
 		NL_SET_ERR_MSG_MOD(extack, "unknown SRv6 Mobile action");
 		return -EOPNOTSUPP;
+	}
+
+	if ((desc->input_family ? : AF_INET6) != family) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile action does not support this address family");
+		return -EINVAL;
 	}
 
 	newts = lwtunnel_state_alloc(sizeof(*slwt));
