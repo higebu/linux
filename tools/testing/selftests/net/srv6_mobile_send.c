@@ -6,12 +6,15 @@
  *   srv6_mobile_send -m end-map -s <src> -d <dst>
  *   srv6_mobile_send -m gtp6-d  -s <src> -d <dst> [-t TEID] [-q QFI]
  *                              [-P PDU_TYPE] [--echo] [--malformed]
+ *   srv6_mobile_send -m gtp4-d  -s <src4> -d <dst4> [-t TEID] [-q QFI]
+ *                              [-P PDU_TYPE] [--echo] [--malformed]
  */
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <netinet/udp.h>
@@ -72,12 +75,15 @@ enum mode {
 	MODE_NONE,
 	MODE_END_MAP,
 	MODE_GTP6_D,
+	MODE_GTP4_D,
 };
 
 struct cfg {
 	enum mode	mode;
 	struct in6_addr	src6;
 	struct in6_addr	dst6;
+	struct in_addr	src4;
+	struct in_addr	dst4;
 	uint32_t	teid;
 	uint8_t		qfi;
 	uint8_t		pdu_type;
@@ -94,8 +100,9 @@ static void usage(const char *bin)
 "Modes:\n"
 "  end-map    Send IPv6 + SRH + ICMPv6 echo for End.MAP testing\n"
 "  gtp6-d     Send IPv6 + UDP + GTPv1-U[+PDU Session] for End.M.GTP6.D testing\n"
+"  gtp4-d     Send IPv4 + UDP + GTPv1-U[+PDU Session] for H.M.GTP4.D testing\n"
 "\n"
-"Mode gtp6-d options:\n"
+"Mode gtp6-d / gtp4-d options:\n"
 "  -t <teid>           GTP-U TEID (decimal or 0xHEX), default 0x123\n"
 "  -q <qfi>            QFI (requires --pdu-session)\n"
 "  -P <pdu-type>       PDU Type (requires --pdu-session)\n"
@@ -136,7 +143,14 @@ static enum mode parse_mode(const char *s)
 		return MODE_END_MAP;
 	if (!strcmp(s, "gtp6-d"))
 		return MODE_GTP6_D;
+	if (!strcmp(s, "gtp4-d"))
+		return MODE_GTP4_D;
 	return MODE_NONE;
+}
+
+static bool mode_is_v4_outer(enum mode m)
+{
+	return m == MODE_GTP4_D;
 }
 
 static int parse_args(int argc, char **argv, struct cfg *cfg)
@@ -158,12 +172,22 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
 			cfg->mode = parse_mode(optarg);
 			break;
 		case 's':
-			if (inet_pton(AF_INET6, optarg, &cfg->src6) != 1)
-				return -1;
+			if (mode_is_v4_outer(cfg->mode)) {
+				if (inet_pton(AF_INET, optarg, &cfg->src4) != 1)
+					return -1;
+			} else {
+				if (inet_pton(AF_INET6, optarg, &cfg->src6) != 1)
+					return -1;
+			}
 			break;
 		case 'd':
-			if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
-				return -1;
+			if (mode_is_v4_outer(cfg->mode)) {
+				if (inet_pton(AF_INET, optarg, &cfg->dst4) != 1)
+					return -1;
+			} else {
+				if (inet_pton(AF_INET6, optarg, &cfg->dst6) != 1)
+					return -1;
+			}
 			break;
 		case 't':
 			if (parse_u32(optarg, &cfg->teid))
@@ -406,6 +430,133 @@ static int send_gtp6_d(const struct cfg *cfg)
 	return 0;
 }
 
+static int send_gtp4_d(const struct cfg *cfg)
+{
+	uint8_t frame[sizeof(struct iphdr) + sizeof(struct udphdr) +
+		      sizeof(struct gtp1_hdr_long) +
+		      sizeof(struct pdu_session_ext) +
+		      sizeof(struct ip6_hdr) + INNER_PAYLOAD_LEN];
+	struct sockaddr_in dst_addr = { .sin_family = AF_INET };
+	struct icmp6_hdr inner_icmp = {};
+	size_t gtp_hdr_len, payload_off, frame_len, plen;
+	struct ip6_hdr *inner;
+	struct iphdr *outer;
+	struct udphdr *uh;
+	uint8_t *gtp_buf;
+	ssize_t res;
+	int fd, one = 1;
+
+	memset(frame, 0, sizeof(frame));
+	outer = (struct iphdr *)frame;
+	uh = (struct udphdr *)(frame + sizeof(*outer));
+	gtp_buf = (uint8_t *)(uh + 1);
+
+	if (cfg->pdu_session_set) {
+		struct gtp1_hdr_long *gtphl = (struct gtp1_hdr_long *)gtp_buf;
+		struct pdu_session_ext *ps;
+
+		gtphl->base.flags = GTP1U_FLAGS_BASE | GTP1U_F_EXTHDR;
+		gtphl->base.type = cfg->echo ? GTP1U_ECHO_REQ : GTP1U_TPDU;
+		gtphl->base.tid = htonl(cfg->teid);
+		gtphl->seq = 0;
+		gtphl->npdu = 0;
+		gtphl->next = GTP1U_NH_PDU_SESSION;
+
+		ps = (struct pdu_session_ext *)(gtphl + 1);
+		ps->ext_len = cfg->malformed ? 0 : 1;
+		ps->pdu_type_spare = (cfg->pdu_type & 0xf) << 4;
+		ps->spare_qfi = cfg->qfi & 0x3f;
+		ps->next_ext = 0;
+
+		gtp_hdr_len = sizeof(*gtphl) + sizeof(*ps);
+	} else {
+		struct gtp1_hdr *gtph = (struct gtp1_hdr *)gtp_buf;
+
+		gtph->flags = GTP1U_FLAGS_BASE;
+		gtph->type = cfg->echo ? GTP1U_ECHO_REQ : GTP1U_TPDU;
+		gtph->tid = htonl(cfg->teid);
+		gtp_hdr_len = sizeof(*gtph);
+	}
+
+	payload_off = sizeof(*outer) + sizeof(*uh) + gtp_hdr_len;
+
+	if (cfg->echo) {
+		((struct gtp1_hdr *)gtp_buf)->length = htons(gtp_hdr_len -
+							     sizeof(struct gtp1_hdr));
+		frame_len = payload_off;
+	} else {
+		inner = (struct ip6_hdr *)(frame + payload_off);
+		inner->ip6_flow = htonl(6u << 28);
+		inner->ip6_plen = htons(sizeof(inner_icmp));
+		inner->ip6_nxt = IPPROTO_ICMPV6;
+		inner->ip6_hops = 64;
+		if (inet_pton(AF_INET6, "2001:db8:100::1", &inner->ip6_src) != 1 ||
+		    inet_pton(AF_INET6, "2001:db8:100::2", &inner->ip6_dst) != 1)
+			return 1;
+
+		inner_icmp.icmp6_type = ICMP6_ECHO_REQUEST;
+		inner_icmp.icmp6_dataun.icmp6_un_data16[0] = htons(0xdead);
+		inner_icmp.icmp6_dataun.icmp6_un_data16[1] = htons(1);
+		inner_icmp.icmp6_cksum = pseudo_csum(&inner->ip6_src,
+						     &inner->ip6_dst,
+						     sizeof(inner_icmp),
+						     IPPROTO_ICMPV6,
+						     &inner_icmp,
+						     sizeof(inner_icmp));
+
+		memcpy(inner + 1, &inner_icmp, sizeof(inner_icmp));
+
+		frame_len = payload_off + sizeof(*inner) + sizeof(inner_icmp);
+		((struct gtp1_hdr *)gtp_buf)->length =
+			htons(frame_len - payload_off + gtp_hdr_len -
+			      sizeof(struct gtp1_hdr));
+	}
+
+	plen = frame_len - sizeof(*outer);
+
+	outer->version = 4;
+	outer->ihl = sizeof(*outer) >> 2;
+	outer->tos = 0;
+	outer->tot_len = htons(frame_len);
+	outer->id = 0;
+	outer->frag_off = htons(IP_DF);
+	outer->ttl = 64;
+	outer->protocol = IPPROTO_UDP;
+	outer->saddr = cfg->src4.s_addr;
+	outer->daddr = cfg->dst4.s_addr;
+	outer->check = 0;
+	outer->check = csum_fold(csum_partial(outer, sizeof(*outer), 0));
+
+	uh->source = htons(GTP1U_PORT);
+	uh->dest = htons(GTP1U_PORT);
+	uh->len = htons(plen);
+	uh->check = 0;	/* optional for IPv4 outer */
+
+	fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+	if (fd < 0) {
+		perror("socket");
+		return 1;
+	}
+	/* IPPROTO_RAW already implies IP_HDRINCL on Linux, but set it
+	 * explicitly so the kernel does not regenerate the IP header.
+	 */
+	if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one))) {
+		perror("IP_HDRINCL");
+		close(fd);
+		return 1;
+	}
+	dst_addr.sin_addr.s_addr = outer->daddr;
+
+	res = sendto(fd, frame, frame_len, 0,
+		     (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+	close(fd);
+	if (res != (ssize_t)frame_len) {
+		perror("sendto");
+		return 1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct cfg cfg = {};
@@ -420,6 +571,8 @@ int main(int argc, char **argv)
 		return send_end_map(&cfg);
 	case MODE_GTP6_D:
 		return send_gtp6_d(&cfg);
+	case MODE_GTP4_D:
+		return send_gtp4_d(&cfg);
 	default:
 		usage(argv[0]);
 		return 3;
