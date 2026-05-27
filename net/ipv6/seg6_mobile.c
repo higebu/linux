@@ -23,6 +23,7 @@
 #include <net/ip6_route.h>
 #include <net/ip_tunnels.h>
 #include <net/ipv6.h>
+#include <net/l3mdev.h>
 #include <net/lwtunnel.h>
 #include <net/route.h>
 #include <net/seg6.h>
@@ -105,6 +106,7 @@ struct seg6_mobile_lwt {
 	bool udp6_zerocsum_tx;
 	u8 v6_src_prefix_len;
 	u8 sr_prefix_len;
+	u32 vrftable;
 	const struct seg6_mobile_action_desc *desc;
 	struct pcpu_seg6_mobile_counters __percpu *pcpu_counters;
 
@@ -249,9 +251,10 @@ static int seg6_mobile_advance_da(struct sk_buff *skb,
 	return 0;
 }
 
-static int seg6_mobile_forward(struct sk_buff *skb)
+static int seg6_mobile_forward(struct sk_buff *skb,
+			       struct seg6_mobile_lwt *slwt)
 {
-	seg6_lookup_nexthop(skb, NULL, 0);
+	seg6_lookup_nexthop(skb, NULL, slwt->vrftable);
 	return dst_input(skb);
 }
 
@@ -271,7 +274,7 @@ static int input_action_end_map(struct sk_buff *skb,
 				   srh && srh->segments_left))
 		goto drop;
 
-	return seg6_mobile_forward(skb);
+	return seg6_mobile_forward(skb, slwt);
 
 drop:
 	kfree_skb(skb);
@@ -564,6 +567,7 @@ static int seg6_mobile_xmit_gtp4_e(struct net *net, struct sk_buff *skb,
 				   u8 qfi, __be16 inner_proto, u8 outer_tclass,
 				   u8 outer_hoplimit)
 {
+	struct net_device *dev = skb->dev;
 	enum skb_drop_reason reason;
 	unsigned int inner_nhlen;
 	struct udphdr *uh;
@@ -628,6 +632,25 @@ static int seg6_mobile_xmit_gtp4_e(struct net *net, struct sk_buff *skb,
 	nf_reset_ct(skb);
 	skb_dst_drop(skb);
 
+	/* A configured vrftable steers the egress lookup into that table by
+	 * routing as if the rebuilt packet ingressed on the bound VRF master
+	 * device; otherwise the lookup keys off the SR-ingress device.  RFC
+	 * 9433 End.M.GTP4.E only requires submitting the packet to the egress
+	 * IPv4 FIB lookup, leaving the table choice to the operator.
+	 */
+	if (slwt->vrftable) {
+		int vrf_ifindex;
+
+		vrf_ifindex = l3mdev_ifindex_lookup_by_table_id(L3MDEV_TYPE_VRF,
+								net,
+								slwt->vrftable);
+		if (vrf_ifindex < 0)
+			goto drop;
+		dev = dev_get_by_index_rcu(net, vrf_ifindex);
+		if (!dev)
+			goto drop;
+	}
+
 	/* Resolve the egress route on the input path and hand the packet
 	 * to dst_input() so it traverses NF_INET_PRE_ROUTING and
 	 * NF_INET_FORWARD like every other transformed MUP packet,
@@ -637,12 +660,16 @@ static int seg6_mobile_xmit_gtp4_e(struct net *net, struct sk_buff *skb,
 	 * device (net.ipv4.conf.<dev>.rp_filter=0) for this behavior.
 	 */
 	reason = ip_route_input(skb, v4_da, v4_sa,
-				inet_dsfield_to_dscp(outer_tclass), skb->dev);
+				inet_dsfield_to_dscp(outer_tclass), dev);
 	if (reason) {
 		kfree_skb_reason(skb, reason);
 		return -EINVAL;
 	}
 	return dst_input(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
 }
 
 /* decapsulate the SRv6 outer and emit IPv4/UDP/GTPv1-U */
@@ -823,9 +850,13 @@ static int seg6_mobile_xmit_gtp6_e(struct sk_buff *skb,
 	 * keeping ip6tables/nftables FORWARD rules effective.  The outer
 	 * IPv6 source is the operator-configured slwt->src_addr with a
 	 * normal reverse route, so unlike End.M.GTP4.E this needs no
-	 * rp_filter relaxation.
+	 * rp_filter relaxation.  A configured vrftable steers the lookup
+	 * into that table, matching the End.M.GTP6.D egress.
 	 */
-	ip6_route_input(skb);
+	if (slwt->vrftable)
+		seg6_lookup_nexthop(skb, NULL, slwt->vrftable);
+	else
+		ip6_route_input(skb);
 	return dst_input(skb);
 }
 
@@ -1114,7 +1145,7 @@ static int input_action_end_m_gtp6_d(struct sk_buff *skb,
 			     &new_srh->segments[new_srh->first_segment]);
 
 	nf_reset_ct(skb);
-	return seg6_mobile_forward(skb);
+	return seg6_mobile_forward(skb, slwt);
 
 drop:
 	kfree_skb(skb);
@@ -1198,7 +1229,7 @@ static int input_action_end_m_gtp6_d_di(struct sk_buff *skb,
 	seg6_mobile_set_addr(skb, &new_srh->segments[0], &orig_dst);
 
 	nf_reset_ct(skb);
-	return seg6_mobile_forward(skb);
+	return seg6_mobile_forward(skb, slwt);
 
 drop:
 	kfree_skb(skb);
@@ -1353,7 +1384,7 @@ static int input_action_h_m_gtp4_d(struct sk_buff *skb,
 		update_csum_diff4(skb, old_flow, *(__be32 *)ipv6_hdr(skb));
 
 	nf_reset_ct(skb);
-	return seg6_mobile_forward(skb);
+	return seg6_mobile_forward(skb, slwt);
 
 drop:
 	kfree_skb(skb);
@@ -1641,6 +1672,60 @@ static int cmp_nla_udp6_zerocsum_tx(struct seg6_mobile_lwt *a,
 	return a->udp6_zerocsum_tx != b->udp6_zerocsum_tx;
 }
 
+static int parse_nla_vrftable(struct nlattr **attrs,
+			      struct seg6_mobile_lwt *slwt,
+			      struct netlink_ext_ack *extack)
+{
+	u32 table = nla_get_u32(attrs[SEG6_MOBILE_VRFTABLE]);
+
+	if (table == 0) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "SRv6 Mobile vrftable must be non-zero");
+		return -EINVAL;
+	}
+	slwt->vrftable = table;
+	return 0;
+}
+
+static int put_nla_vrftable(struct sk_buff *skb, struct seg6_mobile_lwt *slwt)
+{
+	if (nla_put_u32(skb, SEG6_MOBILE_VRFTABLE, slwt->vrftable))
+		return -EMSGSIZE;
+	return 0;
+}
+
+static int cmp_nla_vrftable(struct seg6_mobile_lwt *a,
+			    struct seg6_mobile_lwt *b)
+{
+	return a->vrftable != b->vrftable;
+}
+
+/* The vrftable attribute steers the post-action egress FIB lookup into
+ * a specific VRF table.  Mirror End.DT4's contract: require strict_mode
+ * so the table-to-VRF binding is unambiguous, and require the table to
+ * be bound to a VRF device so the resulting lookup behaves like an
+ * intentional VRF crossing.
+ */
+static int seg6_mobile_check_vrftable(struct net *net,
+				      struct seg6_mobile_lwt *slwt,
+				      struct netlink_ext_ack *extack)
+{
+	int vrf_ifindex;
+
+	vrf_ifindex = l3mdev_ifindex_lookup_by_table_id(L3MDEV_TYPE_VRF, net,
+							slwt->vrftable);
+	if (vrf_ifindex < 0) {
+		if (vrf_ifindex == -EPERM)
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Strict mode for VRF is disabled");
+		else if (vrf_ifindex == -ENODEV)
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Table has no associated VRF device");
+		return vrf_ifindex;
+	}
+	return 0;
+}
+
 static const struct
 nla_policy seg6_mobile_counters_policy[SEG6_MOBILE_CNT_MAX + 1] = {
 	[SEG6_MOBILE_CNT_PACKETS]	= { .type = NLA_U64 },
@@ -1761,7 +1846,8 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN) |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V6_SRC_PREFIX_LEN),
 		.optattrs	= SEG6_F_MOBILE_COUNTERS |
-				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE),
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_VRFTABLE),
 		.input		= input_action_end_m_gtp4_e,
 		.validate	= seg6_mobile_end_m_gtp4_e_validate,
 	},
@@ -1771,7 +1857,8 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
 		.optattrs	= SEG6_F_MOBILE_COUNTERS |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_PDU_TYPE) |
-				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_UDP6_ZEROCSUM_TX),
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_UDP6_ZEROCSUM_TX) |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_VRFTABLE),
 		.input		= input_action_end_m_gtp6_e,
 	},
 	{
@@ -1779,14 +1866,16 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH) |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN),
-		.optattrs	= SEG6_F_MOBILE_COUNTERS,
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_VRFTABLE),
 		.input		= input_action_end_m_gtp6_d,
 	},
 	{
 		.action		= SEG6_MOBILE_ACTION_END_M_GTP6_D_DI,
 		.attrs		= SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRC_ADDR) |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH),
-		.optattrs	= SEG6_F_MOBILE_COUNTERS,
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_VRFTABLE),
 		.input		= input_action_end_m_gtp6_d_di,
 		.validate	= seg6_mobile_end_m_gtp6_d_di_validate,
 	},
@@ -1797,7 +1886,8 @@ static const struct seg6_mobile_action_desc seg6_mobile_action_table[] = {
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SRH) |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_SR_PREFIX_LEN) |
 				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_V6_SRC_PREFIX_LEN),
-		.optattrs	= SEG6_F_MOBILE_COUNTERS,
+		.optattrs	= SEG6_F_MOBILE_COUNTERS |
+				  SEG6_MOBILE_F_ATTR(SEG6_MOBILE_VRFTABLE),
 		.input		= input_action_h_m_gtp4_d,
 		.validate	= seg6_mobile_v4_validate,
 	},
@@ -1847,6 +1937,11 @@ seg6_mobile_action_params[SEG6_MOBILE_MAX + 1] = {
 		.put	= put_nla_udp6_zerocsum_tx,
 		.cmp	= cmp_nla_udp6_zerocsum_tx,
 	},
+	[SEG6_MOBILE_VRFTABLE] = {
+		.parse	= parse_nla_vrftable,
+		.put	= put_nla_vrftable,
+		.cmp	= cmp_nla_vrftable,
+	},
 };
 
 static const struct nla_policy
@@ -1860,6 +1955,7 @@ seg6_mobile_policy[SEG6_MOBILE_MAX + 1] = {
 	[SEG6_MOBILE_SRH]		= { .type = NLA_BINARY },
 	[SEG6_MOBILE_SR_PREFIX_LEN]	= { .type = NLA_U8 },
 	[SEG6_MOBILE_UDP6_ZEROCSUM_TX]	= { .type = NLA_FLAG },
+	[SEG6_MOBILE_VRFTABLE]		= { .type = NLA_U32 },
 };
 
 static const struct seg6_mobile_action_desc *
@@ -2060,6 +2156,15 @@ static int seg6_mobile_build_state(struct net *net, struct nlattr *nla,
 		return err;
 	}
 
+	if (slwt->vrftable) {
+		err = seg6_mobile_check_vrftable(net, slwt, extack);
+		if (err < 0) {
+			destroy_attrs(slwt);
+			kfree(newts);
+			return err;
+		}
+	}
+
 	if (desc->validate) {
 		err = desc->validate(slwt, extack);
 		if (err < 0) {
@@ -2136,6 +2241,9 @@ static int seg6_mobile_get_encap_size(struct lwtunnel_state *lwt)
 
 	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_UDP6_ZEROCSUM_TX))
 		nlsize += nla_total_size(0);
+
+	if (attrs & SEG6_MOBILE_F_ATTR(SEG6_MOBILE_VRFTABLE))
+		nlsize += nla_total_size(sizeof(u32));
 
 	if (attrs & SEG6_F_MOBILE_COUNTERS)
 		nlsize += nla_total_size(0) + /* nest SEG6_MOBILE_COUNTERS */
