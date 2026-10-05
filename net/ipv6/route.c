@@ -1377,7 +1377,8 @@ int ip6_ins_rt(struct net *net, struct fib6_info *rt)
 
 static struct rt6_info *ip6_rt_cache_alloc(const struct fib6_result *res,
 					   const struct in6_addr *daddr,
-					   const struct in6_addr *saddr)
+					   const struct in6_addr *saddr,
+					   unsigned short flags)
 {
 	struct fib6_info *f6i = res->f6i;
 	struct net_device *dev;
@@ -1391,7 +1392,7 @@ static struct rt6_info *ip6_rt_cache_alloc(const struct fib6_result *res,
 		return NULL;
 
 	dev = ip6_rt_get_dev_rcu(res);
-	rt = ip6_dst_alloc(dev_net(dev), dev, 0);
+	rt = ip6_dst_alloc(dev_net(dev), dev, flags);
 	if (!rt) {
 		fib6_info_release(f6i);
 		return NULL;
@@ -1505,6 +1506,103 @@ static struct rt6_info *rt6_make_pcpu_route(struct net *net,
 	}
 
 	return pcpu_rt;
+}
+
+static void rt6_known_nh_release_rcu(struct rcu_head *head)
+{
+	struct dst_entry *dst = container_of(head, struct dst_entry, rcu_head);
+
+	dst_release(dst);
+}
+
+/* A reader may have loaded the clone from its slot without a reference,
+ * and an xfrm bundle holding the clone as its child drops the last one with
+ * dst_release_immediate(), so drop the reference of the slot only after a
+ * grace period.  The slot reference keeps rcu_head unused until then.
+ */
+static void rt6_known_nh_release(struct rt6_info *rt)
+{
+	call_rcu_hurry(&rt->dst.rcu_head, rt6_known_nh_release_rcu);
+}
+
+/* The clone made for FLOWI_FLAG_KNOWN_NH depends only on the route, its
+ * nexthop and the destination, so the last one is kept per CPU in the
+ * nexthop and reused for the same route and destination.  It stays on the
+ * uncached list and is returned with a reference, like a new clone.
+ *
+ * It should be called with rcu_read_lock() acquired.
+ */
+static struct rt6_info *rt6_get_known_nh_route(const struct fib6_result *res,
+					       const struct in6_addr *daddr)
+{
+	struct rt6_info * __percpu *slots;
+	struct rt6_info *rt;
+
+	slots = READ_ONCE(res->nh->rt6i_pcpu_known_nh);
+	if (!slots)
+		return NULL;
+
+	/* the metrics differ after a PMTU update of the clone or a metrics
+	 * update of the route, and the device after an uncached list flush
+	 */
+	rt = this_cpu_read(*slots);
+	if (rt && rcu_access_pointer(rt->from) == res->f6i &&
+	    ipv6_addr_equal(&rt->rt6i_dst.addr, daddr) &&
+	    dst_metrics_ptr(&rt->dst) == res->f6i->fib6_metrics->metrics &&
+	    dst_dev(&rt->dst) == res->nh->fib_nh_dev &&
+	    dst_hold_safe(&rt->dst))
+		return rt;
+
+	return NULL;
+}
+
+static struct rt6_info *rt6_make_known_nh_route(const struct fib6_result *res,
+						const struct in6_addr *daddr)
+{
+	struct rt6_info * __percpu *slots, * __percpu *old;
+	struct rt6_info *rt, *prev;
+
+	/* the device and the flags of a local route follow the state of the
+	 * address and its device
+	 */
+	if (res->fib6_flags & (RTF_LOCAL | RTF_ANYCAST))
+		return NULL;
+
+	slots = READ_ONCE(res->nh->rt6i_pcpu_known_nh);
+	if (!slots) {
+		slots = alloc_percpu_gfp(struct rt6_info *, GFP_ATOMIC);
+		if (!slots)
+			return NULL;
+
+		old = cmpxchg(&res->nh->rt6i_pcpu_known_nh, NULL, slots);
+		if (old) {
+			free_percpu(slots);
+			slots = old;
+		}
+	}
+
+	/* not counted for the dst gc, which cannot free it */
+	rt = ip6_rt_cache_alloc(res, daddr, NULL, DST_NOCOUNT);
+	if (!rt)
+		return NULL;
+
+	rt6_uncached_list_add(rt);
+	dst_hold(&rt->dst);
+
+	/* the previous clone may still be in use, e.g. cached by IPVS */
+	prev = xchg(this_cpu_ptr(slots), rt);
+	if (prev)
+		rt6_known_nh_release(prev);
+
+	/* paired with the mb() in fib6_purge_rt() */
+	if (res->f6i->fib6_destroying) {
+		struct fib6_info *from;
+
+		from = unrcu_pointer(xchg(&rt->from, NULL));
+		fib6_info_release(from);
+	}
+
+	return rt;
 }
 
 /* exception hash table implementation
@@ -2277,15 +2375,24 @@ struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table,
 		 * the daddr in the skb during the neighbor look-up is different
 		 * from the fl6->daddr used to look-up route here.
 		 */
-		rt = ip6_rt_cache_alloc(&res, &fl6->daddr, NULL);
+		local_bh_disable();
+		rt = rt6_get_known_nh_route(&res, &fl6->daddr);
+		if (!rt)
+			rt = rt6_make_known_nh_route(&res, &fl6->daddr);
+		local_bh_enable();
+
+		if (!rt) {
+			rt = ip6_rt_cache_alloc(&res, &fl6->daddr, NULL, 0);
+			if (rt)
+				rt6_uncached_list_add(rt);
+		}
 
 		if (rt) {
-			/* 1 refcnt is taken during ip6_rt_cache_alloc().
+			/* 1 refcnt is taken for the caller.
 			 * As rt6_uncached_list_add() does not consume refcnt,
 			 * this refcnt is always returned to the caller even
 			 * if caller sets RT6_LOOKUP_F_DST_NOREF flag.
 			 */
-			rt6_uncached_list_add(rt);
 			rcu_read_unlock();
 
 			return rt;
@@ -2956,7 +3063,7 @@ static void __ip6_rt_update_pmtu(struct dst_entry *dst, const struct sock *sk,
 			res.nh = res.f6i->fib6_nh;
 		}
 
-		nrt6 = ip6_rt_cache_alloc(&res, daddr, saddr);
+		nrt6 = ip6_rt_cache_alloc(&res, daddr, saddr, 0);
 		if (nrt6) {
 			rt6_do_update_pmtu(nrt6, mtu);
 			if (rt6_insert_exception(nrt6, &res))
@@ -3688,6 +3795,31 @@ out:
 	return err;
 }
 
+/* drop the references of the slots; the clones are on the uncached list,
+ * which moves them off a device that goes away
+ */
+static void fib6_nh_release_known_nh(struct fib6_nh *fib6_nh, bool live)
+{
+	struct rt6_info * __percpu *slots;
+	int cpu;
+
+	slots = READ_ONCE(fib6_nh->rt6i_pcpu_known_nh);
+	if (!slots)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct rt6_info *rt;
+
+		rt = xchg(per_cpu_ptr(slots, cpu), NULL);
+		if (!rt)
+			continue;
+		if (live)
+			rt6_known_nh_release(rt);
+		else
+			dst_release(&rt->dst);
+	}
+}
+
 void fib6_nh_release(struct fib6_nh *fib6_nh)
 {
 	struct rt6_exception_bucket *bucket;
@@ -3703,8 +3835,11 @@ void fib6_nh_release(struct fib6_nh *fib6_nh)
 
 	rcu_read_unlock();
 
+	/* no reader can reach the slots any more */
+	fib6_nh_release_known_nh(fib6_nh, false);
 	fib6_nh_release_dsts(fib6_nh);
 	free_percpu(fib6_nh->rt6i_pcpu);
+	free_percpu(fib6_nh->rt6i_pcpu_known_nh);
 
 	fib_nh_common_release(&fib6_nh->nh_common);
 }
@@ -3712,6 +3847,8 @@ void fib6_nh_release(struct fib6_nh *fib6_nh)
 void fib6_nh_release_dsts(struct fib6_nh *fib6_nh)
 {
 	int cpu;
+
+	fib6_nh_release_known_nh(fib6_nh, true);
 
 	if (!fib6_nh->rt6i_pcpu)
 		return;
@@ -4329,7 +4466,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
 
 	res.fib6_flags = res.f6i->fib6_flags;
 	res.fib6_type = res.f6i->fib6_type;
-	nrt = ip6_rt_cache_alloc(&res, &msg->dest, NULL);
+	nrt = ip6_rt_cache_alloc(&res, &msg->dest, NULL, 0);
 	if (!nrt)
 		goto out;
 

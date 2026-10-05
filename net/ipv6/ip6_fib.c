@@ -973,12 +973,12 @@ insert_above:
 	return ln;
 }
 
-static void __fib6_drop_pcpu_from(struct fib6_nh *fib6_nh,
+static void __fib6_drop_pcpu_from(struct rt6_info * __percpu *pcpu,
 				  const struct fib6_info *match)
 {
 	int cpu;
 
-	if (!fib6_nh->rt6i_pcpu)
+	if (!pcpu)
 		return;
 
 	rcu_read_lock();
@@ -989,7 +989,7 @@ static void __fib6_drop_pcpu_from(struct fib6_nh *fib6_nh,
 		struct rt6_info **ppcpu_rt;
 		struct rt6_info *pcpu_rt;
 
-		ppcpu_rt = per_cpu_ptr(fib6_nh->rt6i_pcpu, cpu);
+		ppcpu_rt = per_cpu_ptr(pcpu, cpu);
 
 		/* Paired with xchg() in rt6_get_pcpu_route() */
 		pcpu_rt = READ_ONCE(*ppcpu_rt);
@@ -1009,11 +1009,18 @@ static void __fib6_drop_pcpu_from(struct fib6_nh *fib6_nh,
 	rcu_read_unlock();
 }
 
+static void fib6_nh_drop_from(struct fib6_nh *nh,
+			      const struct fib6_info *match)
+{
+	__fib6_drop_pcpu_from(nh->rt6i_pcpu, match);
+	__fib6_drop_pcpu_from(READ_ONCE(nh->rt6i_pcpu_known_nh), match);
+}
+
 static int fib6_nh_drop_pcpu_from(struct fib6_nh *nh, void *_arg)
 {
 	struct fib6_info *arg = _arg;
 
-	__fib6_drop_pcpu_from(nh, arg);
+	fib6_nh_drop_from(nh, arg);
 	return 0;
 }
 
@@ -1027,7 +1034,7 @@ static void fib6_drop_pcpu_from(struct fib6_info *f6i)
 		struct fib6_nh *fib6_nh;
 
 		fib6_nh = f6i->fib6_nh;
-		__fib6_drop_pcpu_from(fib6_nh, f6i);
+		fib6_nh_drop_from(fib6_nh, f6i);
 	}
 }
 

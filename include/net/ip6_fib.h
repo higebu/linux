@@ -152,6 +152,7 @@ struct fib6_nh {
 #endif
 
 	struct rt6_info * __percpu *rt6i_pcpu;
+	struct rt6_info * __percpu *rt6i_pcpu_known_nh;
 	struct rt6_exception_bucket __rcu *rt6i_exception_bucket;
 };
 
